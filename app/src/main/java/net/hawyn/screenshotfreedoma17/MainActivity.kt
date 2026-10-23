@@ -28,6 +28,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -49,7 +50,13 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.LinkAnnotation
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -964,9 +971,27 @@ private fun ToggleRow(title: String, description: String, checked: Boolean, togg
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(title, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
             if (mechanism != null) BoxWithConstraints(Modifier.fillMaxWidth()) {
-                val mechanismSize = minOf(13f, maxWidth.value / (mechanism.length * .63f * LocalDensity.current.fontScale)).sp
-                Text(mechanism, fontSize = mechanismSize, maxLines = 1, softWrap = false,
-                    fontWeight = FontWeight.Medium, color = MiuixTheme.colorScheme.primary)
+                val textMeasurer = rememberTextMeasurer()
+                val mechanismStyle = MiuixTheme.textStyles.main.copy(fontWeight = FontWeight.Medium)
+                val availableWidth = (constraints.maxWidth - 1).coerceAtLeast(0)
+                // Fit both labels against the same width so neither row gets a different size.
+                val mechanismSize = remember(availableWidth, mechanismStyle, textMeasurer) {
+                    fun fits(size: Float) = listOf("DISABLE_FLAG_SECURE", "DISABLE_SKIP_SCREENSHOT").all { label ->
+                        textMeasurer.measure(label, style = mechanismStyle.copy(fontSize = size.sp),
+                            maxLines = 1, softWrap = false).size.width <= availableWidth
+                    }
+                    if (fits(13f)) 13.sp else {
+                        var lower = 0.1f
+                        var upper = 13f
+                        repeat(10) {
+                            val candidate = (lower + upper) / 2f
+                            if (fits(candidate)) lower = candidate else upper = candidate
+                        }
+                        lower.sp
+                    }
+                }
+                Text(mechanism, style = mechanismStyle, fontSize = mechanismSize, maxLines = 1, softWrap = false,
+                    color = MiuixTheme.colorScheme.primary)
             }
             Caption(description)
         }
@@ -1038,15 +1063,23 @@ private fun Footer() {
     val context = LocalContext.current
     val uriHandler = LocalUriHandler.current
     val githubUrl = "https://github.com/hawyn2018/screenshot_freedom_A17"
-    Column(Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-        Text("自由截图A17  ${BuildConfig.VERSION_NAME}\n作者：Hawyn; Codex", fontSize = 11.sp, lineHeight = 19.sp,
-            color = MiuixTheme.colorScheme.onSurfaceVariantSummary, textAlign = TextAlign.Center)
-        Text(githubUrl, fontSize = 11.sp, lineHeight = 19.sp, color = MiuixTheme.colorScheme.primary,
-            textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().clickable {
+    val linkColor = MiuixTheme.colorScheme.primary
+    val githubLink = buildAnnotatedString {
+        withLink(LinkAnnotation.Url(githubUrl,
+            styles = TextLinkStyles(style = SpanStyle(color = linkColor)),
+            linkInteractionListener = {
                 runCatching { uriHandler.openUri(githubUrl) }.onFailure {
                     Toast.makeText(context, "未找到可打开链接的应用", Toast.LENGTH_SHORT).show()
                 }
-            }.padding(vertical = 4.dp))
+            })) { append(githubUrl) }
+    }
+    Column(Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        Text("自由截图A17  ${BuildConfig.VERSION_NAME}\n作者：Hawyn; Codex", fontSize = 11.sp, lineHeight = 19.sp,
+            color = MiuixTheme.colorScheme.onSurfaceVariantSummary, textAlign = TextAlign.Center)
+        SelectionContainer {
+            Text(githubLink, fontSize = 11.sp, lineHeight = 19.sp, color = MiuixTheme.colorScheme.primary,
+                textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
+        }
     }
 }
 

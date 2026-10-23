@@ -20,5 +20,10 @@
             android:exported="true" android:label="FLAG_SECURE 测试" />
         <activity-alias android:name=".SkipTestActivity" android:targetActivity=".MainActivity"
             android:exported="true" android:label="SKIP_SCREENSHOT 测试" />
+        <!-- Keep the framework's existing authority and protocol, with caller authentication. -->
+        <provider android:name="io.github.libxposed.service.XposedProvider" tools:node="remove" />
+        <provider android:name=".TrustedXposedProvider"
+            android:authorities="${applicationId}.XposedService"
+            android:exported="true" />
     </application>
 </manifest>

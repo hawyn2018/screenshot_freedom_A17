@@ -1,0 +1,25 @@
+自由截图A17 3.4.7
+包名 net.hawyn.screenshotfreedoma17；versionCode 31；作者 Hawyn; Codex。
+
+框架通信入口
+以自有Provider封装libxposed service 102.0.0的Provider，沿用原authority和通信协议。
+在Binder事务线程中以Binder.getCallingUid检查实际投递方，只接受UID 0和1000。
+拒绝普通应用、shell及其他UID；拒绝发生在读取Bundle或调用SDK之前。
+SDK初始化继续执行，既有服务绑定、死亡通知和框架远端偏好通信沿用原实现。
+拒绝的投递不会替换已经建立的框架连接，也不会触发向其同步名单或设置。
+不按框架名称、签名、机型或系统版本筛选。未来协议/投递身份改变时需要重新适配。
+该检查认证直接投递者，不声称认证附带Binder的宿主，也不抵御被信任root/system。
+
+界面
+主页和主题页底部GitHub链接可点击浏览，也可长按选择并复制。
+“解除窗口限制”下DISABLE_FLAG_SECURE与“阻止图层排除”下DISABLE_SKIP_SCREENSHOT
+采用同一计算字号；两行文字各自保持单行。
+
+交付与验证
+上一版3.4.6保留在releases/3.4.6。
+本版不更新截图/录屏hook、仲裁逻辑、原生程序或系统组件，组件仍为3.4.2。
+构建时与封存3.4.6逐文件比对，只有MainActivity、manifest和新增入口Provider可变化。
+核验最终APK合并后的Provider声明、DEX、签名、源码包与原生资产一致性。
+另对Binder入口执行root/system允许、普通UID拒绝及两个call重载的针对性主机验证。
+用户自行验证UI效果和实际框架连接；不将主机验证描述为LSPosed/Vector真机回归。
+源码包排除签名私钥与本地缓存。

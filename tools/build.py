@@ -10,11 +10,12 @@ import sys
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '3.4.6'
-VERSION_CODE = 30
+VERSION = '3.4.7'
+VERSION_CODE = 31
 # Capture compatibility uses the independently controlled native companion.
 ROOT_COMPONENT_VERSION = '3.4.2'
 UI_BASELINE_VERSION = '3.4.5'
+APP_BASELINE_VERSION = '3.4.6'
 ARTIFACT_NAME = 'ScreenshotFreedomA17'
 SDK = Path(os.environ.get('ANDROID_SDK_ROOT', os.environ.get('ANDROID_HOME', r'D:\AndroidSDK')))
 JDK = Path(os.environ.get('JAVA_HOME', r'C:\Program Files\Eclipse Adoptium\jdk-21.0.12.8-hotspot'))
@@ -72,18 +73,24 @@ def package_root_component():
     return target
 
 
-def verify_unchanged_system_component():
-    """Validate UI-only updates against the sealed current component baseline."""
+def verify_unchanged_system_component(app_only=False):
+    """Keep capture hooks and the native companion sealed during app updates."""
     import json
     import re
-    baseline_dir = ROOT / 'releases' / UI_BASELINE_VERSION
-    baseline_source = baseline_dir / f'{ARTIFACT_NAME}-{UI_BASELINE_VERSION}-source.zip'
+    baseline_version = APP_BASELINE_VERSION if app_only else UI_BASELINE_VERSION
+    baseline_dir = ROOT / 'releases' / baseline_version
+    baseline_source = baseline_dir / f'{ARTIFACT_NAME}-{baseline_version}-source.zip'
     if baseline_source.is_file():
         record = json.loads((baseline_dir / 'release-record.json').read_text(encoding='utf-8'))
         if hashlib.sha256(baseline_source.read_bytes()).hexdigest() != record['artifacts'][baseline_source.name]:
             raise RuntimeError('Preserved component source differs from its sealed release')
         prefix = ARTIFACT_NAME + '/'
         allowed = {'app/src/main/java/net/hawyn/screenshotfreedoma17/MainActivity.kt'}
+        if app_only:
+            # This release changes only the app's incoming framework IPC gate.
+            # Never exempt capture hooks, native assets, or root service files.
+            allowed.update({'app/src/main/AndroidManifest.xml',
+                            'app/src/main/java/net/hawyn/screenshotfreedoma17/TrustedXposedProvider.java'})
         def functional(name):
             return (name.startswith('app/src/') or
                     (name.startswith('native/') and 'build' not in Path(name).parts) or
@@ -94,22 +101,26 @@ def verify_unchanged_system_component():
         current = {p.relative_to(ROOT).as_posix(): p for base in ['app/src', 'native', 'tools']
                    for p in (ROOT / base).rglob('*') if p.is_file() and functional(p.relative_to(ROOT).as_posix())}
         if set(frozen) - set(current) or (set(current) - set(frozen)) - allowed:
-            raise RuntimeError('UI-only update added or removed functional files')
+            raise RuntimeError('App update added or removed unexpected functional files')
         hashes = {}
         for name, path in current.items():
             data = path.read_bytes()
             if name not in allowed:
                 if data != frozen[name]:
-                    raise RuntimeError('UI-only update changed a functional file: ' + name)
+                    raise RuntimeError('App update changed a protected functional file: ' + name)
                 hashes[name] = hashlib.sha256(data).hexdigest()
         report = {'result': 'PASS', 'versionName': VERSION, 'versionCode': VERSION_CODE,
-                  'baseline_version': UI_BASELINE_VERSION, 'allowed_ui_files': sorted(allowed),
+                  'baseline_version': baseline_version, 'allowed_app_files' if app_only else 'allowed_ui_files': sorted(allowed),
                   'byte_identical_functional_files': hashes,
-                  'manual_testing': 'Only build/package parity is checked; user will perform UI tests.'}
-        target = ROOT / ('verification/v' + VERSION.replace('.', '') + '-ui-parity-verification.json')
+                  'manual_testing': 'Capture hooks/native companion are unchanged; user will perform UI and framework compatibility tests.'}
+        suffix = '-app-parity-verification.json' if app_only else '-ui-parity-verification.json'
+        target = ROOT / ('verification/v' + VERSION.replace('.', '') + suffix)
         target.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-        print('UI_ONLY_SYSTEM_PARITY_OK', len(hashes), 'byte-identical functional files;', UI_BASELINE_VERSION)
+        print('APP_ONLY_SYSTEM_PARITY_OK' if app_only else 'UI_ONLY_SYSTEM_PARITY_OK',
+              len(hashes), 'byte-identical functional files;', baseline_version)
         return
+    if app_only:
+        raise FileNotFoundError('Missing sealed app baseline: ' + str(baseline_source))
     frozen = ROOT / 'releases/2.0.0/functional-files-sha256.json'
     if not frozen.is_file():
         raise FileNotFoundError('Missing preserved 2.0 functional file manifest')
@@ -199,7 +210,7 @@ def package_sources():
     if lockfile.exists():
         selected.append(lockfile)
     selected.extend(p for p in (ROOT / 'deps').glob('*.json') if p.is_file())
-    for name in ['V2-TestReport.txt', 'V21-ReleaseNotes.txt', 'V22-ReleaseNotes.txt', 'V23-ReleaseNotes.txt', 'V24-ReleaseNotes.txt', 'V241-ReleaseNotes.txt', 'V242-ReleaseNotes.txt', 'V243-ReleaseNotes.txt', 'V244-ReleaseNotes.txt', 'V245-ReleaseNotes.txt', 'V246-ReleaseNotes.txt', 'V3-ReleaseNotes.txt', 'V31-ReleaseNotes.txt', 'V32-ReleaseNotes.txt', 'V33-ReleaseNotes.txt', 'V34-ReleaseNotes.txt', 'V641-ReleaseNotes.txt', 'V342-ReleaseNotes.txt', 'V343-ReleaseNotes.txt', 'V344-ReleaseNotes.txt', 'V345-ReleaseNotes.txt', 'V346-ReleaseNotes.txt']:
+    for name in ['V2-TestReport.txt', 'V21-ReleaseNotes.txt', 'V22-ReleaseNotes.txt', 'V23-ReleaseNotes.txt', 'V24-ReleaseNotes.txt', 'V241-ReleaseNotes.txt', 'V242-ReleaseNotes.txt', 'V243-ReleaseNotes.txt', 'V244-ReleaseNotes.txt', 'V245-ReleaseNotes.txt', 'V246-ReleaseNotes.txt', 'V3-ReleaseNotes.txt', 'V31-ReleaseNotes.txt', 'V32-ReleaseNotes.txt', 'V33-ReleaseNotes.txt', 'V34-ReleaseNotes.txt', 'V641-ReleaseNotes.txt', 'V342-ReleaseNotes.txt', 'V343-ReleaseNotes.txt', 'V344-ReleaseNotes.txt', 'V345-ReleaseNotes.txt', 'V346-ReleaseNotes.txt', 'V347-ReleaseNotes.txt']:
         report = ROOT / 'verification' / name
         if report.is_file():
             selected.append(report)
@@ -241,7 +252,11 @@ def main():
     if not keystore.is_file() or not password_file.is_file():
         raise FileNotFoundError('Restore the existing signing/screenshot-compat.jks and signing/keystore.pass before building an update')
     if '--sign-only' not in sys.argv:
-        if '--ui-only' in sys.argv:
+        if '--ui-only' in sys.argv and '--app-only' in sys.argv:
+            raise ValueError('Choose either --ui-only or --app-only')
+        if '--app-only' in sys.argv:
+            verify_unchanged_system_component(app_only=True)
+        elif '--ui-only' in sys.argv:
             verify_unchanged_system_component()
         else:
             prepare_native()
