@@ -10,11 +10,11 @@ import sys
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '3.4.5'
-VERSION_CODE = 29
+VERSION = '3.4.6'
+VERSION_CODE = 30
 # Capture compatibility uses the independently controlled native companion.
 ROOT_COMPONENT_VERSION = '3.4.2'
-UI_BASELINE_VERSION = '3.4.4'
+UI_BASELINE_VERSION = '3.4.5'
 ARTIFACT_NAME = 'ScreenshotFreedomA17'
 SDK = Path(os.environ.get('ANDROID_SDK_ROOT', os.environ.get('ANDROID_HOME', r'D:\AndroidSDK')))
 JDK = Path(os.environ.get('JAVA_HOME', r'C:\Program Files\Eclipse Adoptium\jdk-21.0.12.8-hotspot'))
@@ -83,10 +83,7 @@ def verify_unchanged_system_component():
         if hashlib.sha256(baseline_source.read_bytes()).hexdigest() != record['artifacts'][baseline_source.name]:
             raise RuntimeError('Preserved component source differs from its sealed release')
         prefix = ARTIFACT_NAME + '/'
-        allowed = {'app/src/main/AndroidManifest.xml',
-                   'app/src/main/res/drawable/ic_launcher_foreground.xml',
-                   'app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml',
-                   'app/src/main/res/mipmap-anydpi-v33/ic_launcher.xml'}
+        allowed = {'app/src/main/java/net/hawyn/screenshotfreedoma17/MainActivity.kt'}
         def functional(name):
             return (name.startswith('app/src/') or
                     (name.startswith('native/') and 'build' not in Path(name).parts) or
@@ -202,7 +199,7 @@ def package_sources():
     if lockfile.exists():
         selected.append(lockfile)
     selected.extend(p for p in (ROOT / 'deps').glob('*.json') if p.is_file())
-    for name in ['V2-TestReport.txt', 'V21-ReleaseNotes.txt', 'V22-ReleaseNotes.txt', 'V23-ReleaseNotes.txt', 'V24-ReleaseNotes.txt', 'V241-ReleaseNotes.txt', 'V242-ReleaseNotes.txt', 'V243-ReleaseNotes.txt', 'V244-ReleaseNotes.txt', 'V245-ReleaseNotes.txt', 'V246-ReleaseNotes.txt', 'V3-ReleaseNotes.txt', 'V31-ReleaseNotes.txt', 'V32-ReleaseNotes.txt', 'V33-ReleaseNotes.txt', 'V34-ReleaseNotes.txt', 'V641-ReleaseNotes.txt', 'V342-ReleaseNotes.txt', 'V343-ReleaseNotes.txt', 'V344-ReleaseNotes.txt', 'V345-ReleaseNotes.txt']:
+    for name in ['V2-TestReport.txt', 'V21-ReleaseNotes.txt', 'V22-ReleaseNotes.txt', 'V23-ReleaseNotes.txt', 'V24-ReleaseNotes.txt', 'V241-ReleaseNotes.txt', 'V242-ReleaseNotes.txt', 'V243-ReleaseNotes.txt', 'V244-ReleaseNotes.txt', 'V245-ReleaseNotes.txt', 'V246-ReleaseNotes.txt', 'V3-ReleaseNotes.txt', 'V31-ReleaseNotes.txt', 'V32-ReleaseNotes.txt', 'V33-ReleaseNotes.txt', 'V34-ReleaseNotes.txt', 'V641-ReleaseNotes.txt', 'V342-ReleaseNotes.txt', 'V343-ReleaseNotes.txt', 'V344-ReleaseNotes.txt', 'V345-ReleaseNotes.txt', 'V346-ReleaseNotes.txt']:
         report = ROOT / 'verification' / name
         if report.is_file():
             selected.append(report)

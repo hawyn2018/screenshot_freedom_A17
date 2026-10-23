@@ -1,0 +1,13 @@
+自由截图A17 3.4.6
+包名 net.hawyn.screenshotfreedoma17；versionCode 30；作者 Hawyn; Codex。
+
+主页顶部ENABLE SCREENSHOT改为SCREENSHOT FREEDOM。
+底部作者行改为“作者：Hawyn; Codex”。
+作者下一行放置项目链接：https://github.com/hawyn2018/screenshot_freedom_A17
+链接可点击打开；设备缺少可用处理应用时给出提示。
+主页与主题页共用底部样式，链接随所在页面自然滚动。
+
+系统hook、仲裁、原生程序、图标与所有配置逻辑保持3.4.5原样。
+系统组件仍为3.4.2，不更新模块、不修改作用域或用户设置。
+仅构建和核对包体后推送并通过root覆盖安装到当前连接设备，由用户手动查看效果。
+3.4.5及更早交付保留在releases目录。

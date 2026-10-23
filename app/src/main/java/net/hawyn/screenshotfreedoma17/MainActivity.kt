@@ -46,6 +46,7 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
@@ -469,7 +470,7 @@ private fun HomePage(insets: PaddingValues, status: RuntimeStatus, controller: C
         })
     PageList(insets) {
         item {
-            PageHeading("ENABLE SCREENSHOT", "自由截图A17", "DISABLE FLAG_SECURE+DISABLE SKIP_SCREENSHOT二合一彻底破除截图限制。") {
+            PageHeading("SCREENSHOT FREEDOM", "自由截图A17", "DISABLE FLAG_SECURE+DISABLE SKIP_SCREENSHOT二合一彻底破除截图限制。") {
                 Pill(BuildConfig.VERSION_NAME, MiuixTheme.colorScheme.primary)
             }
         }
@@ -1034,8 +1035,19 @@ private fun PalettePreview(accent: Color) {
 
 @Composable
 private fun Footer() {
-    Text("自由截图A17  ${BuildConfig.VERSION_NAME}\nHawyn; Codex", fontSize = 11.sp, lineHeight = 19.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-        textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp))
+    val context = LocalContext.current
+    val uriHandler = LocalUriHandler.current
+    val githubUrl = "https://github.com/hawyn2018/screenshot_freedom_A17"
+    Column(Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        Text("自由截图A17  ${BuildConfig.VERSION_NAME}\n作者：Hawyn; Codex", fontSize = 11.sp, lineHeight = 19.sp,
+            color = MiuixTheme.colorScheme.onSurfaceVariantSummary, textAlign = TextAlign.Center)
+        Text(githubUrl, fontSize = 11.sp, lineHeight = 19.sp, color = MiuixTheme.colorScheme.primary,
+            textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().clickable {
+                runCatching { uriHandler.openUri(githubUrl) }.onFailure {
+                    Toast.makeText(context, "未找到可打开链接的应用", Toast.LENGTH_SHORT).show()
+                }
+            }.padding(vertical = 4.dp))
+    }
 }
 
 private object AppIcons {
