@@ -12,6 +12,10 @@ data class Appearance(
     val colorSpec: String = "Spec2025",
     val floatingBar: Boolean = true,
     val liquidGlass: Boolean = true,
+    // GLOBAL_BLUR_FIELDS_BEGIN
+    val topBlurStrength: Float = 1f,
+    val bottomBlurStrength: Float = 1f,
+    // GLOBAL_BLUR_FIELDS_END
     // GLASS_APPEARANCE_FIELDS_BEGIN
     val lowerGlassTransparency: Float = .5f,
     val lowerGlassColorStrength: Float = 1f,
@@ -33,6 +37,15 @@ class UiPreferences(context: Context) {
         colorSpec = preferences.getString("color_spec", "Spec2025") ?: "Spec2025",
         floatingBar = preferences.getBoolean("floating_bar", true),
         liquidGlass = preferences.getBoolean("liquid_glass", true),
+        // GLOBAL_BLUR_READ_BEGIN
+        // Inherit the old global value only while each new key is absent.
+        topBlurStrength = preferences.getFloat(
+            if (preferences.contains("top_blur_strength")) "top_blur_strength" else "global_blur_strength", 1f)
+            .let { if (it.isFinite()) it.coerceIn(0f, 2f) else 1f },
+        bottomBlurStrength = preferences.getFloat(
+            if (preferences.contains("bottom_blur_strength")) "bottom_blur_strength" else "global_blur_strength", 1f)
+            .let { if (it.isFinite()) it.coerceIn(0f, 2f) else 1f },
+        // GLOBAL_BLUR_READ_END
         // GLASS_APPEARANCE_READ_BEGIN
         lowerGlassTransparency = preferences.getFloat("lower_glass_transparency", .5f)
             .let { if (it.isFinite()) it.coerceIn(0f, 1f) else .5f },
@@ -50,6 +63,10 @@ class UiPreferences(context: Context) {
             .putBoolean("follow_accent", value.followAccent).putLong("accent", value.accent)
             .putString("palette", value.palette).putString("color_spec", value.colorSpec)
             .putBoolean("floating_bar", value.floatingBar).putBoolean("liquid_glass", value.liquidGlass)
+            // GLOBAL_BLUR_WRITE_BEGIN
+            .putFloat("top_blur_strength", value.topBlurStrength.let { if (it.isFinite()) it.coerceIn(0f, 2f) else 1f })
+            .putFloat("bottom_blur_strength", value.bottomBlurStrength.let { if (it.isFinite()) it.coerceIn(0f, 2f) else 1f })
+            // GLOBAL_BLUR_WRITE_END
             // GLASS_APPEARANCE_WRITE_BEGIN
             .putFloat("lower_glass_transparency", value.lowerGlassTransparency.let { if (it.isFinite()) it.coerceIn(0f, 1f) else .5f })
             .putFloat("lower_glass_color_strength", value.lowerGlassColorStrength.let { if (it.isFinite()) it.coerceIn(0f, 2f) else 1f })

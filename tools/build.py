@@ -10,12 +10,12 @@ import sys
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '3.4.7'
-VERSION_CODE = 31
+VERSION = '3.5.6'
+VERSION_CODE = 40
 # Capture compatibility uses the independently controlled native companion.
 ROOT_COMPONENT_VERSION = '3.4.2'
-UI_BASELINE_VERSION = '3.4.5'
-APP_BASELINE_VERSION = '3.4.6'
+UI_BASELINE_VERSION = '3.5.5'
+APP_BASELINE_VERSION = '3.5.5'
 ARTIFACT_NAME = 'ScreenshotFreedomA17'
 SDK = Path(os.environ.get('ANDROID_SDK_ROOT', os.environ.get('ANDROID_HOME', r'D:\AndroidSDK')))
 JDK = Path(os.environ.get('JAVA_HOME', r'C:\Program Files\Eclipse Adoptium\jdk-21.0.12.8-hotspot'))
@@ -103,8 +103,31 @@ def verify_unchanged_system_component(app_only=False):
         if set(frozen) - set(current) or (set(current) - set(frozen)) - allowed:
             raise RuntimeError('App update added or removed unexpected functional files')
         hashes = {}
+        isolated_ui_changes = {}
         for name, path in current.items():
             data = path.read_bytes()
+            if name == 'app/src/main/java/net/hawyn/screenshotfreedoma17/UiPreferences.kt' and data != frozen[name]:
+                # Independent top/bottom blur keys may change only these existing
+                # appearance blocks. Every other preference and storage rule stays sealed.
+                def without_blur_blocks(raw):
+                    text = raw.decode('utf-8').replace('\r\n', '\n')
+                    for section in ['FIELDS', 'READ', 'WRITE']:
+                        begin = '// GLOBAL_BLUR_' + section + '_BEGIN'
+                        end = '// GLOBAL_BLUR_' + section + '_END'
+                        if text.count(begin) != 1 or text.count(end) != 1:
+                            raise RuntimeError('Missing or duplicate blur appearance boundary: ' + section)
+                        text, count = re.subn(r'(?m)^[ \t]*' + re.escape(begin) + r'\n[\s\S]*?^[ \t]*' + re.escape(end) + r'\n', '', text)
+                        if count != 1:
+                            raise RuntimeError('Invalid blur appearance block: ' + section)
+                    return text
+                if without_blur_blocks(data) != without_blur_blocks(frozen[name]):
+                    raise RuntimeError('App update changed a non-blur appearance key or storage rule')
+                isolated_ui_changes[name] = {
+                    'scope': 'GLOBAL_BLUR_FIELDS/READ/WRITE blocks only; all other text identical',
+                    'baseline_sha256': hashlib.sha256(frozen[name]).hexdigest(),
+                    'sha256': hashlib.sha256(data).hexdigest(),
+                }
+                continue
             if name not in allowed:
                 if data != frozen[name]:
                     raise RuntimeError('App update changed a protected functional file: ' + name)
@@ -112,6 +135,7 @@ def verify_unchanged_system_component(app_only=False):
         report = {'result': 'PASS', 'versionName': VERSION, 'versionCode': VERSION_CODE,
                   'baseline_version': baseline_version, 'allowed_app_files' if app_only else 'allowed_ui_files': sorted(allowed),
                   'byte_identical_functional_files': hashes,
+                  'isolated_ui_changes': isolated_ui_changes,
                   'manual_testing': 'Capture hooks/native companion are unchanged; user will perform UI and framework compatibility tests.'}
         suffix = '-app-parity-verification.json' if app_only else '-ui-parity-verification.json'
         target = ROOT / ('verification/v' + VERSION.replace('.', '') + suffix)
@@ -210,7 +234,7 @@ def package_sources():
     if lockfile.exists():
         selected.append(lockfile)
     selected.extend(p for p in (ROOT / 'deps').glob('*.json') if p.is_file())
-    for name in ['V2-TestReport.txt', 'V21-ReleaseNotes.txt', 'V22-ReleaseNotes.txt', 'V23-ReleaseNotes.txt', 'V24-ReleaseNotes.txt', 'V241-ReleaseNotes.txt', 'V242-ReleaseNotes.txt', 'V243-ReleaseNotes.txt', 'V244-ReleaseNotes.txt', 'V245-ReleaseNotes.txt', 'V246-ReleaseNotes.txt', 'V3-ReleaseNotes.txt', 'V31-ReleaseNotes.txt', 'V32-ReleaseNotes.txt', 'V33-ReleaseNotes.txt', 'V34-ReleaseNotes.txt', 'V641-ReleaseNotes.txt', 'V342-ReleaseNotes.txt', 'V343-ReleaseNotes.txt', 'V344-ReleaseNotes.txt', 'V345-ReleaseNotes.txt', 'V346-ReleaseNotes.txt', 'V347-ReleaseNotes.txt']:
+    for name in ['V2-TestReport.txt', 'V21-ReleaseNotes.txt', 'V22-ReleaseNotes.txt', 'V23-ReleaseNotes.txt', 'V24-ReleaseNotes.txt', 'V241-ReleaseNotes.txt', 'V242-ReleaseNotes.txt', 'V243-ReleaseNotes.txt', 'V244-ReleaseNotes.txt', 'V245-ReleaseNotes.txt', 'V246-ReleaseNotes.txt', 'V3-ReleaseNotes.txt', 'V31-ReleaseNotes.txt', 'V32-ReleaseNotes.txt', 'V33-ReleaseNotes.txt', 'V34-ReleaseNotes.txt', 'V641-ReleaseNotes.txt', 'V342-ReleaseNotes.txt', 'V343-ReleaseNotes.txt', 'V344-ReleaseNotes.txt', 'V345-ReleaseNotes.txt', 'V346-ReleaseNotes.txt', 'V347-ReleaseNotes.txt', 'V348-ReleaseNotes.txt', 'V349-ReleaseNotes.txt', 'V350-ReleaseNotes.txt', 'V351-ReleaseNotes.txt', 'V352-ReleaseNotes.txt', 'V353-ReleaseNotes.txt', 'V354-ReleaseNotes.txt', 'V355-ReleaseNotes.txt', 'V356-ReleaseNotes.txt']:
         report = ROOT / 'verification' / name
         if report.is_file():
             selected.append(report)

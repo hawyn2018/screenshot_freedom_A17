@@ -18,9 +18,12 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.PagerState
 import androidx.compose.foundation.pager.rememberPagerState
@@ -36,9 +39,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -46,9 +55,14 @@ import androidx.compose.ui.graphics.vector.path
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInParent
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
@@ -205,10 +219,24 @@ private class SurfaceTestSession {
     }
 }
 
+private class PageHeaderState(val title: String) {
+    // Measured by the invisible layout placeholder; both values are independent of scroll.
+    var titleOffsetPx by mutableFloatStateOf(0f)
+    var titleHeightPx by mutableFloatStateOf(0f)
+}
+
 @Composable
 private fun ScreenshotApp(activity: MainActivity, controller: CompatController, preferences: UiPreferences, initialTab: Int, navigationSerial: Int) {
     var appearance by remember { mutableStateOf(preferences.read()) }
     val pager = rememberPagerState(initialPage = initialTab, pageCount = { 4 })
+    val homeScroll = rememberLazyListState()
+    val secureScroll = rememberLazyListState()
+    val skipScroll = rememberScrollState()
+    val themeScroll = rememberLazyListState()
+    val headers = remember { listOf(
+        PageHeaderState("自由截图A17"), PageHeaderState("窗口保护测试"),
+        PageHeaderState("图层排除测试"), PageHeaderState("主题与外观"),
+    ) }
     val selected = pager.currentPage
     val pagePosition = (pager.currentPage + pager.currentPageOffsetFraction).coerceIn(0f, 3f)
     val fullySettled by remember { derivedStateOf {
@@ -289,25 +317,32 @@ private fun ScreenshotApp(activity: MainActivity, controller: CompatController, 
             containerColor = MiuixTheme.colorScheme.surface,
             bottomBar = { Box(Modifier.imePadding()) { AppNavigation(selected, pagePosition, navigate, appearance, backdrop, dark) } },
         ) { insets ->
-            Box(Modifier.fillMaxSize().then(if (backdrop != null) Modifier.layerBackdrop(backdrop) else Modifier)
-                .background(MiuixTheme.colorScheme.surface)) {
-                HorizontalPager(
-                    state = pager,
-                    beyondViewportPageCount = 1,
-                    key = { it },
-                    modifier = Modifier.fillMaxSize().clipToBounds(),
-                ) { tab ->
-                    Box(Modifier.fillMaxSize().clipToBounds()) {
-                        when (tab) {
-                            1 -> SecurePage(insets, secureRequest, { secureRequest = it })
-                            2 -> SkipPage(insets, status)
-                            3 -> ThemePage(insets, appearance, updateAppearance, accent)
-                            else -> HomePage(insets, status, controller) {
-                                status = controller.runtimeStatus()
+            val safeTop = pageTopInset(insets)
+            Box(Modifier.fillMaxSize().background(MiuixTheme.colorScheme.surface)) {
+                // The one shared capture source contains only page content. Both navigation
+                // and the floating titles draw outside it, so neither can sample itself.
+                Box(Modifier.fillMaxSize().then(if (backdrop != null) Modifier.layerBackdrop(backdrop) else Modifier)
+                    .background(MiuixTheme.colorScheme.surface)) {
+                    HorizontalPager(
+                        state = pager,
+                        beyondViewportPageCount = 1,
+                        key = { it },
+                        modifier = Modifier.fillMaxSize().clipToBounds(),
+                    ) { tab ->
+                        Box(Modifier.fillMaxSize().clipToBounds()) {
+                            when (tab) {
+                                1 -> SecurePage(insets, secureScroll, headers[1], secureRequest, { secureRequest = it })
+                                2 -> SkipPage(insets, skipScroll, headers[2], status)
+                                3 -> ThemePage(insets, themeScroll, headers[3], appearance, updateAppearance, accent)
+                                else -> HomePage(insets, homeScroll, headers[0], status, controller) {
+                                    status = controller.runtimeStatus()
+                                }
                             }
                         }
                     }
                 }
+                PageTopBars(headers, listOf(homeScroll, secureScroll, null, themeScroll), skipScroll,
+                    pagePosition, selected, safeTop, insets, backdrop, backgroundBlurRadius(appearance.topBlurStrength))
             }
         }
     }
@@ -338,6 +373,7 @@ private fun AppNavigation(selected: Int, position: Float, select: (Int) -> Unit,
         unselectedContentColor = MiuixTheme.colorScheme.onSurface,
     )
     val glass = appearance.liquidGlass && backdrop != null
+    val blurRadius = backgroundBlurRadius(appearance.bottomBlurStrength)
     val lowerSaturation = 1f + .35f * appearance.lowerGlassColorStrength
     if (appearance.floatingBar) {
         FloatingNavigationBar(
@@ -353,7 +389,7 @@ private fun AppNavigation(selected: Int, position: Float, select: (Int) -> Unit,
                         .textureBlur(
                             backdrop = backdrop,
                             shape = RoundedCornerShape(30.dp),
-                            blurRadius = 22f,
+                            blurRadius = blurRadius,
                             colors = BlurColors(
                                 blendColors = listOf(BlendColorEntry(MiuixTheme.colorScheme.surfaceContainer.copy(alpha = lowerGlassSurfaceAlpha(.56f, appearance.lowerGlassTransparency)), BlurBlendMode.SrcOver)),
                                 saturation = lowerSaturation,
@@ -386,7 +422,7 @@ private fun AppNavigation(selected: Int, position: Float, select: (Int) -> Unit,
                 .textureBlur(
                     backdrop = backdrop,
                     shape = RoundedCornerShape(0.dp),
-                    blurRadius = 22f,
+                    blurRadius = blurRadius,
                     colors = BlurColors(blendColors = listOf(BlendColorEntry(MiuixTheme.colorScheme.surfaceContainer.copy(alpha = lowerGlassSurfaceAlpha(.62f, appearance.lowerGlassTransparency)), BlurBlendMode.SrcOver)), saturation = lowerSaturation),
                     highlight = if (dark) Highlight.GlassStrokeMiddleDark else Highlight.GlassStrokeMiddleLight,
                 ))
@@ -436,34 +472,185 @@ private fun GlassSelectionPill(position: Float, width: Dp, step: Dp, start: Dp, 
 }
 
 @Composable
-private fun PageList(insets: PaddingValues, content: androidx.compose.foundation.lazy.LazyListScope.() -> Unit) {
+private fun pageTopInset(insets: PaddingValues): Dp = maxOf(insets.calculateTopPadding(),
+    WindowInsets.statusBars.union(WindowInsets.displayCutout).asPaddingValues().calculateTopPadding())
+
+private fun backgroundBlurRadius(strength: Float): Float = 22f * strength.let {
+    if (it.isFinite()) it.coerceIn(0f, 2f) else 1f
+}
+
+@Composable
+private fun PageTopBars(headers: List<PageHeaderState>, lists: List<LazyListState?>, skipScroll: ScrollState,
+                        pagePosition: Float, selected: Int, safeTop: Dp, insets: PaddingValues, backdrop: LayerBackdrop?, blurRadius: Float) {
+    val density = LocalDensity.current
+    val direction = LocalLayoutDirection.current
+    val startPadding = 22.dp + insets.calculateStartPadding(direction)
+    val endPadding = 22.dp + insets.calculateEndPadding(direction)
+    val textMeasurer = rememberTextMeasurer()
+    val titleStyle = MiuixTheme.textStyles.main.copy(fontWeight = FontWeight.Bold)
+    val blurColors = BlurDefaults.blurColors(
+        blendColors = emptyList(), brightness = 0f, contrast = 1f, saturation = 1f,
+    )
+    // Keep strong blur over the readable part of the bar instead of losing most
+    // of its radius before the transparency fade has even reached the lower edge.
+    val topBlurGradient = remember { ProgressiveBlur.Top.copy(curve = 3f) }
+    val titleColor = MiuixTheme.colorScheme.onSurface
+    val expandedTopPx = with(density) { (safeTop + 26.dp).toPx() }
+    // Every page uses the same home reference, independent of its title glyphs.
+    val sharedBarReferenceHeight = with(density) { textMeasurer.measure(
+        headers[0].title, style = titleStyle.copy(fontSize = 20.sp), maxLines = 1, softWrap = false,
+    ).size.height.toDp() }
+    val barHeight = safeTop + 12.dp + sharedBarReferenceHeight + 36.dp + 18.9.dp
+    val blurTransitionPx = with(density) { 32.dp.toPx() }
+    // Use one anchor for every page, including home. Start from the previous
+    // non-home clamp, then lower it by about 1.5 mm (9.45 dp at baseline density).
+    val pinnedTopPx = with(density) {
+        val referenceHeight = textMeasurer.measure(
+            headers[1].title, style = titleStyle.copy(fontSize = 20.sp), maxLines = 1, softWrap = false,
+        ).size.height.toFloat()
+        val expandedHeight = textMeasurer.measure(
+            headers[1].title, style = titleStyle.copy(fontSize = 31.sp), maxLines = 1, softWrap = false,
+        ).size.height.toFloat()
+        val previousOffset = ((48.dp.toPx() + referenceHeight - expandedHeight).coerceAtLeast(0f) / 2f - 18.9.dp.toPx()).coerceAtLeast(0f)
+        safeTop.toPx() + previousOffset + 9.45.dp.toPx()
+    }
+    BoxWithConstraints(Modifier.fillMaxSize().clipToBounds()) {
+        val widthPx = constraints.maxWidth
+        headers.forEachIndexed { index, header ->
+            if (abs(index - pagePosition) < 1f) {
+                val list = lists[index]
+                val scrollPx = if (list != null) {
+                    if (list.firstVisibleItemIndex == 0) list.firstVisibleItemScrollOffset.toFloat() else Float.POSITIVE_INFINITY
+                } else skipScroll.value.toFloat()
+                // A restored list may start beyond item zero, before its heading has ever
+                // been composed. Independently measured metrics keep its pinned title ready.
+                val expandedHeightPx = textMeasurer.measure(
+                    header.title, style = titleStyle.copy(fontSize = 31.sp), maxLines = 1, softWrap = false,
+                ).size.height.toFloat()
+                val naturalTopPx = expandedTopPx + header.titleOffsetPx
+                val restoredOffscreen = list?.firstVisibleItemIndex?.let { it > 0 }
+                    ?: (scrollPx > naturalTopPx + expandedHeightPx)
+                val overlayReady = header.titleHeightPx > 0f || restoredOffscreen
+                // Identical scroll distance produces identical background opacity on all
+                // four pages; title movement must not alter the blur transition.
+                val backgroundAlpha = (scrollPx / blurTransitionPx).coerceIn(0f, 1f)
+                val titleTopPx = if (restoredOffscreen) pinnedTopPx else (naturalTopPx - scrollPx).coerceAtLeast(pinnedTopPx)
+                val titleTravelPx = naturalTopPx - pinnedTopPx
+                val titleCollapse = if (restoredOffscreen || titleTravelPx <= 0f) 1f else (scrollPx / titleTravelPx).coerceIn(0f, 1f)
+                val titleScale = 1f - titleCollapse * (1f - 3f / 4f)
+                Box(Modifier.fillMaxSize().offset {
+                    IntOffset(((index - pagePosition) * widthPx).roundToInt(), 0)
+                }) {
+                    if (backgroundAlpha > 0f && backdrop != null) {
+                        Box(Modifier.fillMaxWidth().height(barHeight)
+                            .graphicsLayer {
+                                alpha = backgroundAlpha
+                                compositingStrategy = CompositingStrategy.Offscreen
+                            }
+                            .drawWithCache {
+                                // Preserve the blurred sample through the middle, then
+                                // fade its alpha to zero near the clear lower edge.
+                                val fadeMask = Brush.verticalGradient(
+                                    0f to Color.White,
+                                    .4f to Color.White,
+                                    .65f to Color.White.copy(alpha = .97f),
+                                    .8f to Color.White.copy(alpha = .83f),
+                                    .9f to Color.White.copy(alpha = .57f),
+                                    .96f to Color.White.copy(alpha = .28f),
+                                    1f to Color.White.copy(alpha = 0f),
+                                )
+                                onDrawWithContent {
+                                    // Mask the completed blur in this outer RGBA layer.
+                                    // Do not route the mask through the blur node's
+                                    // nested content layer or any of its RenderEffects.
+                                    drawContent()
+                                    drawRect(brush = fadeMask, blendMode = BlendMode.DstIn)
+                                }
+                            }
+                            .progressiveTextureBlur(
+                                backdrop = backdrop,
+                                shape = RectangleShape,
+                                blurRadius = blurRadius,
+                                gradient = topBlurGradient,
+                                noiseCoefficient = 0f,
+                                colors = blurColors,
+                                highlight = null,
+                                contentBlendMode = BlendMode.SrcOver,
+                            ))
+                    }
+                    if (overlayReady) {
+                        Text(header.title,
+                            modifier = Modifier.offset { IntOffset(0, titleTopPx.roundToInt()) }
+                                .fillMaxWidth().padding(start = startPadding, end = endPadding)
+                                .graphicsLayer {
+                                    // Scale only the title, inside its fixed safe padding.
+                                    // Keep its physical top-left corner on the same path.
+                                    transformOrigin = TransformOrigin(0f, 0f)
+                                    scaleX = titleScale
+                                    scaleY = titleScale
+                                }
+                                .then(if (selected == index) Modifier.semantics { heading() } else Modifier.clearAndSetSemantics {}),
+                            fontSize = 31.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = titleColor,
+                            maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PageList(insets: PaddingValues, state: LazyListState, content: androidx.compose.foundation.lazy.LazyListScope.() -> Unit) {
+    val direction = LocalLayoutDirection.current
     LazyColumn(
         modifier = Modifier.fillMaxSize().imePadding(),
-        contentPadding = PaddingValues(start = 22.dp, end = 22.dp, top = insets.calculateTopPadding() + 26.dp, bottom = 154.dp),
+        state = state,
+        contentPadding = PaddingValues(start = 22.dp + insets.calculateStartPadding(direction),
+            end = 22.dp + insets.calculateEndPadding(direction), top = pageTopInset(insets) + 26.dp, bottom = 154.dp),
         verticalArrangement = Arrangement.spacedBy(18.dp),
         content = content,
     )
 }
 
 @Composable
-private fun PageHeading(eyebrow: String, title: String, subtitle: String, trailing: @Composable (() -> Unit)? = null) {
+private fun PageHeading(header: PageHeaderState, eyebrow: String, subtitle: String, trailing: @Composable (() -> Unit)? = null) {
+    // Capture in composition: the first frame is painted here, then both layers switch
+    // ownership together once placement has provided the floating title's exact anchor.
+    val overlayReady = header.titleHeightPx > 0f
+    // The version pill used to make only home's eyebrow taller. Give all four
+    // rows its font-scaled height so the title starts and moves on the same line.
+    val textMeasurer = rememberTextMeasurer()
+    val eyebrowHeight = with(LocalDensity.current) { textMeasurer.measure(
+        BuildConfig.VERSION_NAME,
+        style = MiuixTheme.textStyles.main.copy(fontSize = 11.sp, fontWeight = FontWeight.SemiBold),
+        maxLines = 1, softWrap = false,
+    ).size.height.toDp() + 12.dp }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(bottom = 2.dp)) {
-        if (trailing == null) {
-            Text(eyebrow, color = MiuixTheme.colorScheme.primary, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
-        } else {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text(eyebrow, color = MiuixTheme.colorScheme.primary, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp,
-                    modifier = Modifier.weight(1f), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
-                trailing()
-            }
+        Row(Modifier.fillMaxWidth().heightIn(min = eyebrowHeight), verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text(eyebrow, color = MiuixTheme.colorScheme.primary, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp,
+                modifier = Modifier.weight(1f), maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
+            trailing?.invoke()
         }
-        Text(title, fontSize = 31.sp, fontWeight = FontWeight.Bold, color = MiuixTheme.colorScheme.onSurface)
+        // Once measured, the floating layer paints this title. Keep its actual font-scaled
+        // space here without exposing duplicate semantics or changing list geometry.
+        Text(header.title, fontSize = 31.sp, fontWeight = FontWeight.Bold,
+            maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.graphicsLayer { alpha = if (overlayReady) 0f else 1f }
+                .then(if (overlayReady) Modifier.clearAndSetSemantics {} else Modifier.semantics { heading() })
+                .onGloballyPositioned {
+                    header.titleOffsetPx = it.positionInParent().y
+                    header.titleHeightPx = it.size.height.toFloat()
+                })
         Caption(subtitle)
     }
 }
 
 @Composable
-private fun HomePage(insets: PaddingValues, status: RuntimeStatus, controller: CompatController, settingsChanged: () -> Unit) {
+private fun HomePage(insets: PaddingValues, scroll: LazyListState, header: PageHeaderState, status: RuntimeStatus, controller: CompatController, settingsChanged: () -> Unit) {
     val context = LocalContext.current
     var showCaptureTools by remember { mutableStateOf(false) }
     if (showCaptureTools) CaptureToolPicker(controller.getCaptureToolPackages(),
@@ -475,9 +662,9 @@ private fun HomePage(insets: PaddingValues, status: RuntimeStatus, controller: C
             showCaptureTools = false
             Toast.makeText(context, "工具名单已保存，请重新开始采集", Toast.LENGTH_SHORT).show()
         })
-    PageList(insets) {
+    PageList(insets, scroll) {
         item {
-            PageHeading("SCREENSHOT FREEDOM", "自由截图A17", "DISABLE FLAG_SECURE+DISABLE SKIP_SCREENSHOT二合一彻底破除截图限制。") {
+            PageHeading(header, "SCREENSHOT FREEDOM", "DISABLE FLAG_SECURE+DISABLE SKIP_SCREENSHOT二合一彻底破除截图限制。") {
                 Pill(BuildConfig.VERSION_NAME, MiuixTheme.colorScheme.primary)
             }
         }
@@ -638,10 +825,10 @@ private fun HomePage(insets: PaddingValues, status: RuntimeStatus, controller: C
 }
 
 @Composable
-private fun SecurePage(insets: PaddingValues, requested: Boolean, setRequested: (Boolean) -> Unit) {
+private fun SecurePage(insets: PaddingValues, scroll: LazyListState, header: PageHeaderState, requested: Boolean, setRequested: (Boolean) -> Unit) {
     var seed by rememberSaveable { mutableIntStateOf(1) }
-    PageList(insets) {
-        item { PageHeading("WINDOW CAPTURE", "窗口保护测试", "这一页主动设置真实 FLAG_SECURE。") }
+    PageList(insets, scroll) {
+        item { PageHeading(header, "WINDOW CAPTURE", "这一页主动设置真实 FLAG_SECURE。") }
         item {
             Card(cornerRadius = 24.dp) {
                 ToggleRow("为此页设置窗口保护", if (requested) "设置 FLAG_SECURE，离开时清除" else "窗口保护已关闭，当前为对照状态",
@@ -663,7 +850,8 @@ private fun SecurePage(insets: PaddingValues, requested: Boolean, setRequested: 
 }
 
 @Composable
-private fun SkipPage(insets: PaddingValues, status: RuntimeStatus) {
+private fun SkipPage(insets: PaddingValues, scroll: ScrollState, header: PageHeaderState, status: RuntimeStatus) {
+    val direction = LocalLayoutDirection.current
     var requestSkip by rememberSaveable { mutableStateOf(true) }
     var seed by rememberSaveable { mutableIntStateOf(1) }
     var retryEpoch by remember { mutableIntStateOf(0) }
@@ -685,11 +873,12 @@ private fun SkipPage(insets: PaddingValues, status: RuntimeStatus) {
         else -> frameState.message
     }
     Column(
-        modifier = Modifier.fillMaxSize().imePadding().verticalScroll(rememberScrollState())
-            .padding(start = 22.dp, end = 22.dp, top = insets.calculateTopPadding() + 26.dp, bottom = 154.dp),
+        modifier = Modifier.fillMaxSize().imePadding().verticalScroll(scroll)
+            .padding(start = 22.dp + insets.calculateStartPadding(direction), end = 22.dp + insets.calculateEndPadding(direction),
+                top = pageTopInset(insets) + 26.dp, bottom = 154.dp),
         verticalArrangement = Arrangement.spacedBy(18.dp),
     ) {
-        PageHeading("LAYER CAPTURE", "图层排除测试", "实际内容放在独立 SurfaceControlViewHost 子树。")
+        PageHeading(header, "LAYER CAPTURE", "实际内容放在独立 SurfaceControlViewHost 子树。")
         Card(cornerRadius = 24.dp) {
             ToggleRow("请求排除此测试图层", "调用真实 SKIP_SCREENSHOT 事务，不设置窗口保护", requestSkip, { requestSkip = it }, AppIcons.Layers)
         }
@@ -765,7 +954,7 @@ private fun SkipPage(insets: PaddingValues, status: RuntimeStatus) {
 }
 
 @Composable
-private fun ThemePage(insets: PaddingValues, value: Appearance, update: (Appearance) -> Unit, accent: Color) {
+private fun ThemePage(insets: PaddingValues, scroll: LazyListState, header: PageHeaderState, value: Appearance, update: (Appearance) -> Unit, accent: Color) {
     var colorInput by remember(value.accent) { mutableStateOf("%06X".format(value.accent and 0xFFFFFF)) }
     var colorError by remember { mutableStateOf(false) }
     val supportsGlass = isRuntimeShaderSupported()
@@ -773,8 +962,8 @@ private fun ThemePage(insets: PaddingValues, value: Appearance, update: (Appeara
         "TonalSpot" to "柔和", "Neutral" to "中性", "Vibrant" to "鲜明", "Expressive" to "表现力",
         "Rainbow" to "彩虹", "FruitSalad" to "缤纷", "Monochrome" to "单色", "Fidelity" to "保真", "Content" to "内容",
     )
-    PageList(insets) {
-        item { PageHeading("MAKE IT YOURS", "主题与外观", "每一处调整，都会即时应用并保存。") }
+    PageList(insets, scroll) {
+        item { PageHeading(header, "MAKE IT YOURS", "每一处调整，都会即时应用并保存。") }
         item {
             Card(cornerRadius = 24.dp, insideMargin = PaddingValues(20.dp)) {
                 Text("外观模式", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
@@ -798,6 +987,16 @@ private fun ThemePage(insets: PaddingValues, value: Appearance, update: (Appeara
                     !supportsGlass -> "当前设备未提供所需的实时渲染能力"
                     else -> "两种底栏均使用实时背景模糊与滑动纯色选中层"
                 }, value.liquidGlass, { update(value.copy(liquidGlass = it)) }, AppIcons.Theme, supportsGlass)
+                Rule()
+                GlassAppearanceSlider("顶部模糊强度", value.topBlurStrength, 0f..2f,
+                    "调整状态栏与四页顶栏。默认100%，0%关闭顶部模糊。", supportsGlass) {
+                    update(value.copy(topBlurStrength = it))
+                }
+                Rule()
+                GlassAppearanceSlider("底部模糊强度", value.bottomBlurStrength, 0f..2f,
+                    "调整两种液态玻璃底栏。默认100%，0%关闭底部模糊。", value.liquidGlass && supportsGlass) {
+                    update(value.copy(bottomBlurStrength = it))
+                }
                 Rule()
                 GlassAppearanceSlider("下层玻璃透明度", value.lowerGlassTransparency, 0f..1f,
                     "越高越通透，50%为默认。仅液态玻璃启用时生效。", value.liquidGlass && supportsGlass) {
