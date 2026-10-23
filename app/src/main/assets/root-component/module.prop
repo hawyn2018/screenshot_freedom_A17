@@ -1,0 +1,6 @@
+id=enable_screenshot17fix
+name=自由截图A17
+version=3.4.2
+versionCode=26
+author=Hawyn; Codex
+description=截图与录屏按采集工具名单仲裁，受限采集会话优先保留图层排除。等待系统桥会话登记，按唯一过滤代码匹配；关闭、异常退出或卸载时还原自有补丁。

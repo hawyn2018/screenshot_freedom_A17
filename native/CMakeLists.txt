@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.22)
+project(sf17fix LANGUAGES CXX)
+add_executable(sf17fix sf17fix.cpp policy_broker.cpp)
+target_compile_features(sf17fix PRIVATE cxx_std_20)
+target_compile_options(sf17fix PRIVATE -Wall -Wextra -Werror -fstack-protector-strong -fPIE -fvisibility=hidden)
+target_link_options(sf17fix PRIVATE -pie -Wl,-z,relro,-z,now,-z,noexecstack,-z,max-page-size=16384)
+set_target_properties(sf17fix PROPERTIES OUTPUT_NAME "libsf17fix.so")

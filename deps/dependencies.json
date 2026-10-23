@@ -1,0 +1,36 @@
+{
+  "gradle": "9.8.0",
+  "agp": "9.4.1",
+  "kotlin": "2.4.20",
+  "compose-multiplatform": "1.12.0",
+  "miuix": "0.9.4",
+  "libxposed-api": "102.0.0",
+  "libxposed-service": "102.0.0",
+  "hiddenapibypass": "6.2",
+  "reference-artifacts": {
+    "api-102.0.0.aar": {
+      "url": "https://repo.maven.apache.org/maven2/io/github/libxposed/api/102.0.0/api-102.0.0.aar",
+      "sha256": "423484a6e1807e7a423c4b88fcd8176d104318259d91791877fed88fe91479d0"
+    },
+    "api-102.0.0-sources.jar": {
+      "url": "https://repo.maven.apache.org/maven2/io/github/libxposed/api/102.0.0/api-102.0.0-sources.jar",
+      "sha256": "c4a5761c2409f411ca0f67983a687fbd9dd9a76250d7a68ab7cb2950c820444e"
+    },
+    "service-102.0.0-sources.jar": {
+      "url": "https://repo.maven.apache.org/maven2/io/github/libxposed/service/102.0.0/service-102.0.0-sources.jar",
+      "sha256": "74cd4c36acc4f0251a80a2fc19eddca7f0e330d99a5d4b1c6a07b6136f3459c6"
+    },
+    "miuix-ui-android-0.9.4-sources.jar": {
+      "url": "https://repo.maven.apache.org/maven2/top/yukonga/miuix/kmp/miuix-ui-android/0.9.4/miuix-ui-android-0.9.4-sources.jar",
+      "sha256": "222fdeb29a03024139b15c0cb50eec7b03721698ff80f1d5207e2a928935c453"
+    },
+    "miuix-core-android-0.9.4-sources.jar": {
+      "url": "https://repo.maven.apache.org/maven2/top/yukonga/miuix/kmp/miuix-core-android/0.9.4/miuix-core-android-0.9.4-sources.jar",
+      "sha256": "b229381fa0cce5e3f834f81bb1b72f42a8ed2c1d4d4786e9f177d6778b0a9503"
+    },
+    "miuix-blur-android-0.9.4-sources.jar": {
+      "url": "https://repo.maven.apache.org/maven2/top/yukonga/miuix/kmp/miuix-blur-android/0.9.4/miuix-blur-android-0.9.4-sources.jar",
+      "sha256": "6e260b8fec768315f5b689ae4a5f944aadabdc76437f4caa10d5b4f93ed90a0a"
+    }
+  }
+}

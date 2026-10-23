@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Preserve the original icon palette on systems without Monet resources. -->
+    <color name="module_icon_background">#155E75</color>
+    <color name="module_icon_foreground">#FFFFFF</color>
+</resources>

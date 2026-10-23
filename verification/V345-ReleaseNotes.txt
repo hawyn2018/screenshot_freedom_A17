@@ -1,0 +1,12 @@
+自由截图A17 3.4.5
+包名 net.hawyn.screenshotfreedoma17；versionCode 29；作者 Hawyn; Codex。
+
+桌面入口改为标准Adaptive Icon，背景与前景分开，背景使用3.4.4的Monet底色铺满。
+前景保留原取景框和勾选pathData、比例、线宽与圆形线帽。
+以108dp画布居中布局，实际前景位于中央66dp安全圆内，外轮廓由系统mask决定。
+普通icon与roundIcon均指向自适应资源；API33及以上增加monochrome图层。
+旧普通矢量图和全部Monet配色资源保留。
+
+Java/Kotlin逻辑、LSPosed hook、原生程序和系统组件与3.4.4保持一致。
+系统组件继续沿用3.4.2；保留应用设置、框架作用域和旧版本。
+只构建、核对包体、推送并通过root覆盖安装APK；桌面效果由用户手动查看。

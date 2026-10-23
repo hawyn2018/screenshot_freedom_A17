@@ -1,0 +1,33 @@
+Screenshot Freedom A17 (formerly Screenshot Compat)
+Authors: Hawyn; Codex
+
+Screenshot compatibility methods are informed by the GPL-3.0 projects
+LSPosed/DisableFlagSecure and LuckyTool and the local device framework audit.
+This module is distributed with complete source under GPL-3.0.
+https://github.com/LSPosed/DisableFlagSecure
+https://github.com/luckyzyx/LuckyTool
+
+Compile-only dependency:
+libxposed API 102.0.0 (Apache License 2.0)
+https://github.com/libxposed/api
+The framework API implementation is not included in the module APK.
+
+2.0 user interface dependencies (Apache License 2.0):
+miuix UI, core, blur and icons, version 0.9.4
+https://github.com/compose-miuix-ui/miuix
+JetBrains Compose Multiplatform, version 1.12.0
+https://github.com/JetBrains/compose-multiplatform
+AndroidX Activity, Core, Lifecycle and Compose dependencies
+https://android.googlesource.com/platform/frameworks/support/
+Kotlin standard library, version 2.4.20
+https://github.com/JetBrains/kotlin
+libxposed service, version 102.0.0
+https://github.com/libxposed/service
+Android HiddenApiBypass, version 6.2 (used only by this module app's test surface)
+https://github.com/LSPosed/AndroidHiddenApiBypass
+
+Root companion semantics are based on Android Open Source Project
+SurfaceFlinger, ScreenCaptureOutput and LayerFilter source (Apache License 2.0):
+https://android.googlesource.com/platform/frameworks/native/
+The companion is independently implemented and distributed under GPL-3.0.
+No original system binary is distributed or modified on disk.

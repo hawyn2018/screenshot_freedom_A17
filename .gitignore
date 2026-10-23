@@ -1,0 +1,35 @@
+# Local signing material and credentials
+/signing/
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.key
+*.pass
+*.pem
+.env
+.env.*
+credentials.json
+secrets.*
+
+# Generated files, caches and local SDK configuration
+.build/
+.gradle/
+.gradle-cache/
+.kotlin/
+**/build/
+/dist/
+/releases/
+/local.properties
+/deps/*.jar
+/deps/*.aar
+/app/src/main/assets/native/
+__pycache__/
+*.pyc
+*.apk
+*.aab
+*.log
+*.db
+*.sqlite*
+.idea/
+*.iml

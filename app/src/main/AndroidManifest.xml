@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <!-- Blur is optional and only initialized after its runtime capability check. -->
+    <uses-sdk tools:overrideLibrary="top.yukonga.miuix.kmp.blur" />
+    <!-- A user-selected capture-tool list must include non-launcher applications. -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <application android:label="@string/app_name" android:description="@string/module_description"
+        android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher"
+        android:theme="@style/AppTheme"
+        android:allowBackup="false" android:supportsRtl="true">
+        <meta-data android:name="module_author" android:value="Hawyn; Codex" />
+        <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity-alias android:name=".SecureTestActivity" android:targetActivity=".MainActivity"
+            android:exported="true" android:label="FLAG_SECURE 测试" />
+        <activity-alias android:name=".SkipTestActivity" android:targetActivity=".MainActivity"
+            android:exported="true" android:label="SKIP_SCREENSHOT 测试" />
+    </application>
+</manifest>

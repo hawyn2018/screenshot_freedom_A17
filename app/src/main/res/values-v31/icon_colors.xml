@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Read the system Monet palette directly, including outside our activity theme. -->
+    <color name="module_icon_background">@android:color/system_accent1_100</color>
+    <color name="module_icon_foreground">@android:color/system_accent1_700</color>
+</resources>
