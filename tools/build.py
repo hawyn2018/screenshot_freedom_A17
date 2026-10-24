@@ -10,12 +10,12 @@ import sys
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '3.5.6'
-VERSION_CODE = 40
+VERSION = '3.5.9'
+VERSION_CODE = 43
 # Capture compatibility uses the independently controlled native companion.
-ROOT_COMPONENT_VERSION = '3.4.2'
-UI_BASELINE_VERSION = '3.5.5'
-APP_BASELINE_VERSION = '3.5.5'
+ROOT_COMPONENT_VERSION = '3.5.9'
+UI_BASELINE_VERSION = '3.5.6'
+APP_BASELINE_VERSION = '3.5.6'
 ARTIFACT_NAME = 'ScreenshotFreedomA17'
 SDK = Path(os.environ.get('ANDROID_SDK_ROOT', os.environ.get('ANDROID_HOME', r'D:\AndroidSDK')))
 JDK = Path(os.environ.get('JAVA_HOME', r'C:\Program Files\Eclipse Adoptium\jdk-21.0.12.8-hotspot'))
@@ -73,11 +73,71 @@ def package_root_component():
     return target
 
 
-def verify_unchanged_system_component(app_only=False):
+def verify_compatibility_update_scope():
+    """Seal unrelated behavior while allowing the 3.5.9 native access and logging fix."""
+    import json
+    baseline = ROOT / 'releases/3.5.8_debug'
+    source = baseline / f'{ARTIFACT_NAME}-3.5.8_debug-source.zip'
+    # Public snapshots omit private developer release archives. Only skip the
+    # historical source comparison when BOTH inputs are genuinely absent.
+    record_path = baseline / 'release-record.json'
+    if not any(path.exists() or path.is_symlink() for path in (source, record_path)):
+        print('PUBLIC_BUILD: historical source baseline absent; full native/APK build continues')
+        return
+    record = json.loads((baseline / 'release-record.json').read_text(encoding='utf-8'))
+    if hashlib.sha256(source.read_bytes()).hexdigest() != record['artifacts'][source.name]:
+        raise RuntimeError('Diagnostic baseline source differs from its sealed release')
+    allowed = {
+        'app/src/main/java/net/hawyn/screenshotfreedoma17/MainActivity.kt',
+        'app/src/main/java/net/hawyn/screenshotfreedoma17/Diagnostics.java',
+        'app/src/main/java/net/hawyn/screenshotfreedoma17/CompatController.java',
+        'native/sf17fix.cpp', 'native/README-native.txt', 'native/root-module/module.prop',
+        'app/src/main/assets/native/arm64-v8a/libsf17fix.so',
+        'app/src/main/assets/root-component/module.prop',
+    }
+    def functional(name):
+        return (name.startswith('app/src/') or
+                (name.startswith('native/') and 'build' not in Path(name).parts) or
+                name == 'tools/native_build.py')
+    prefix = ARTIFACT_NAME + '/'
+    with zipfile.ZipFile(source) as archive:
+        previous = {name[len(prefix):]: archive.read(name) for name in archive.namelist()
+                    if name.startswith(prefix) and functional(name[len(prefix):])}
+    current = {path.relative_to(ROOT).as_posix(): path for base in ['app/src', 'native', 'tools']
+               for path in (ROOT / base).rglob('*')
+               if path.is_file() and functional(path.relative_to(ROOT).as_posix())}
+    if set(previous) != set(current):
+        raise RuntimeError('Compatibility update added or removed unexpected functional files')
+    protected, changed = {}, {}
+    for name, path in current.items():
+        data = path.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        if name in allowed:
+            changed[name] = {'baseline_sha256': hashlib.sha256(previous[name]).hexdigest(), 'sha256': digest}
+        elif name == 'native/root-module/customize.sh':
+            if data.replace(b'3.5.9', b'3.4.2', 1) != previous[name]:
+                raise RuntimeError('Root installer banner changed beyond the version label')
+            changed[name] = {'scope': 'Version label only', 'sha256': digest}
+        elif data != previous[name]:
+            raise RuntimeError('Compatibility update changed a protected file: ' + name)
+        else:
+            protected[name] = digest
+    report = {'result': 'PASS', 'versionName': VERSION, 'versionCode': VERSION_CODE,
+              'baseline_version': '3.5.8_debug', 'allowed_functional_files': changed,
+              'byte_identical_functional_files': protected,
+              'device_validation': False,
+              'scope': 'Native mapped-file access/cache, verified installer migration, opt-in logs and log controls. '
+                       'Capture hooks, arbitration protocol/broker, root service, renderer and appearance preferences are preserved.'}
+    target = ROOT / 'verification/v359-compatibility-scope-verification.json'
+    target.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    print('COMPATIBILITY_UPDATE_SCOPE_OK', len(protected), 'byte-identical functional files')
+
+
+def verify_unchanged_system_component(app_only=False, diagnostics_only=False):
     """Keep capture hooks and the native companion sealed during app updates."""
     import json
     import re
-    baseline_version = APP_BASELINE_VERSION if app_only else UI_BASELINE_VERSION
+    baseline_version = APP_BASELINE_VERSION if app_only or diagnostics_only else UI_BASELINE_VERSION
     baseline_dir = ROOT / 'releases' / baseline_version
     baseline_source = baseline_dir / f'{ARTIFACT_NAME}-{baseline_version}-source.zip'
     if baseline_source.is_file():
@@ -86,6 +146,9 @@ def verify_unchanged_system_component(app_only=False):
             raise RuntimeError('Preserved component source differs from its sealed release')
         prefix = ARTIFACT_NAME + '/'
         allowed = {'app/src/main/java/net/hawyn/screenshotfreedoma17/MainActivity.kt'}
+        if diagnostics_only:
+            allowed.update({'app/src/main/java/net/hawyn/screenshotfreedoma17/CompatController.java',
+                            'app/src/main/java/net/hawyn/screenshotfreedoma17/Diagnostics.java'})
         if app_only:
             # This release changes only the app's incoming framework IPC gate.
             # Never exempt capture hooks, native assets, or root service files.
@@ -106,7 +169,27 @@ def verify_unchanged_system_component(app_only=False):
         isolated_ui_changes = {}
         for name, path in current.items():
             data = path.read_bytes()
-            if name == 'app/src/main/java/net/hawyn/screenshotfreedoma17/UiPreferences.kt' and data != frozen[name]:
+            if diagnostics_only and name == 'app/src/main/AndroidManifest.xml':
+                import xml.etree.ElementTree as ET
+                original_manifest = ET.fromstring(frozen[name])
+                diagnostic_manifest = ET.fromstring(data)
+                android = '{http://schemas.android.com/apk/res/android}'
+                additions = [element for element in diagnostic_manifest.findall('uses-permission')
+                             if element.get(android + 'name') == 'android.permission.WRITE_EXTERNAL_STORAGE']
+                if len(additions) != 1 or additions[0].attrib != {
+                        android + 'name': 'android.permission.WRITE_EXTERNAL_STORAGE', android + 'maxSdkVersion': '28'}:
+                    raise RuntimeError('Diagnostics may add only legacy public Download write permission')
+                diagnostic_manifest.remove(additions[0])
+                for tree in [original_manifest, diagnostic_manifest]:
+                    for element in tree.iter():
+                        if element.text is not None and not element.text.strip(): element.text = None
+                        if element.tail is not None and not element.tail.strip(): element.tail = None
+                if ET.tostring(original_manifest) != ET.tostring(diagnostic_manifest):
+                    raise RuntimeError('Diagnostics changed an existing manifest component, permission or attribute')
+                isolated_ui_changes[name] = {'scope': 'Only WRITE_EXTERNAL_STORAGE with maxSdkVersion 28 added; other XML unchanged',
+                                              'sha256': hashlib.sha256(data).hexdigest()}
+                continue
+            if not diagnostics_only and name == 'app/src/main/java/net/hawyn/screenshotfreedoma17/UiPreferences.kt' and data != frozen[name]:
                 # Independent top/bottom blur keys may change only these existing
                 # appearance blocks. Every other preference and storage rule stays sealed.
                 def without_blur_blocks(raw):
@@ -133,17 +216,18 @@ def verify_unchanged_system_component(app_only=False):
                     raise RuntimeError('App update changed a protected functional file: ' + name)
                 hashes[name] = hashlib.sha256(data).hexdigest()
         report = {'result': 'PASS', 'versionName': VERSION, 'versionCode': VERSION_CODE,
-                  'baseline_version': baseline_version, 'allowed_app_files' if app_only else 'allowed_ui_files': sorted(allowed),
+                  'baseline_version': baseline_version,
+                  'allowed_diagnostic_files' if diagnostics_only else ('allowed_app_files' if app_only else 'allowed_ui_files'): sorted(allowed),
                   'byte_identical_functional_files': hashes,
                   'isolated_ui_changes': isolated_ui_changes,
                   'manual_testing': 'Capture hooks/native companion are unchanged; user will perform UI and framework compatibility tests.'}
-        suffix = '-app-parity-verification.json' if app_only else '-ui-parity-verification.json'
+        suffix = '-diagnostics-parity-verification.json' if diagnostics_only else ('-app-parity-verification.json' if app_only else '-ui-parity-verification.json')
         target = ROOT / ('verification/v' + VERSION.replace('.', '') + suffix)
         target.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-        print('APP_ONLY_SYSTEM_PARITY_OK' if app_only else 'UI_ONLY_SYSTEM_PARITY_OK',
+        print('DIAGNOSTICS_ONLY_SYSTEM_PARITY_OK' if diagnostics_only else ('APP_ONLY_SYSTEM_PARITY_OK' if app_only else 'UI_ONLY_SYSTEM_PARITY_OK'),
               len(hashes), 'byte-identical functional files;', baseline_version)
         return
-    if app_only:
+    if app_only or diagnostics_only:
         raise FileNotFoundError('Missing sealed app baseline: ' + str(baseline_source))
     frozen = ROOT / 'releases/2.0.0/functional-files-sha256.json'
     if not frozen.is_file():
@@ -234,7 +318,7 @@ def package_sources():
     if lockfile.exists():
         selected.append(lockfile)
     selected.extend(p for p in (ROOT / 'deps').glob('*.json') if p.is_file())
-    for name in ['V2-TestReport.txt', 'V21-ReleaseNotes.txt', 'V22-ReleaseNotes.txt', 'V23-ReleaseNotes.txt', 'V24-ReleaseNotes.txt', 'V241-ReleaseNotes.txt', 'V242-ReleaseNotes.txt', 'V243-ReleaseNotes.txt', 'V244-ReleaseNotes.txt', 'V245-ReleaseNotes.txt', 'V246-ReleaseNotes.txt', 'V3-ReleaseNotes.txt', 'V31-ReleaseNotes.txt', 'V32-ReleaseNotes.txt', 'V33-ReleaseNotes.txt', 'V34-ReleaseNotes.txt', 'V641-ReleaseNotes.txt', 'V342-ReleaseNotes.txt', 'V343-ReleaseNotes.txt', 'V344-ReleaseNotes.txt', 'V345-ReleaseNotes.txt', 'V346-ReleaseNotes.txt', 'V347-ReleaseNotes.txt', 'V348-ReleaseNotes.txt', 'V349-ReleaseNotes.txt', 'V350-ReleaseNotes.txt', 'V351-ReleaseNotes.txt', 'V352-ReleaseNotes.txt', 'V353-ReleaseNotes.txt', 'V354-ReleaseNotes.txt', 'V355-ReleaseNotes.txt', 'V356-ReleaseNotes.txt']:
+    for name in ['V2-TestReport.txt', 'V21-ReleaseNotes.txt', 'V22-ReleaseNotes.txt', 'V23-ReleaseNotes.txt', 'V24-ReleaseNotes.txt', 'V241-ReleaseNotes.txt', 'V242-ReleaseNotes.txt', 'V243-ReleaseNotes.txt', 'V244-ReleaseNotes.txt', 'V245-ReleaseNotes.txt', 'V246-ReleaseNotes.txt', 'V3-ReleaseNotes.txt', 'V31-ReleaseNotes.txt', 'V32-ReleaseNotes.txt', 'V33-ReleaseNotes.txt', 'V34-ReleaseNotes.txt', 'V641-ReleaseNotes.txt', 'V342-ReleaseNotes.txt', 'V343-ReleaseNotes.txt', 'V344-ReleaseNotes.txt', 'V345-ReleaseNotes.txt', 'V346-ReleaseNotes.txt', 'V347-ReleaseNotes.txt', 'V348-ReleaseNotes.txt', 'V349-ReleaseNotes.txt', 'V350-ReleaseNotes.txt', 'V351-ReleaseNotes.txt', 'V352-ReleaseNotes.txt', 'V353-ReleaseNotes.txt', 'V354-ReleaseNotes.txt', 'V355-ReleaseNotes.txt', 'V356-ReleaseNotes.txt', 'V358Debug-ReleaseNotes.txt', 'V359-ReleaseNotes.txt']:
         report = ROOT / 'verification' / name
         if report.is_file():
             selected.append(report)
@@ -276,14 +360,18 @@ def main():
     if not keystore.is_file() or not password_file.is_file():
         raise FileNotFoundError('Restore the existing signing/screenshot-compat.jks and signing/keystore.pass before building an update')
     if '--sign-only' not in sys.argv:
-        if '--ui-only' in sys.argv and '--app-only' in sys.argv:
-            raise ValueError('Choose either --ui-only or --app-only')
-        if '--app-only' in sys.argv:
+        if sum(flag in sys.argv for flag in ['--ui-only', '--app-only', '--diagnostics-only']) > 1:
+            raise ValueError('Choose one app update verification mode')
+        if '--diagnostics-only' in sys.argv:
+            verify_unchanged_system_component(diagnostics_only=True)
+        elif '--app-only' in sys.argv:
             verify_unchanged_system_component(app_only=True)
         elif '--ui-only' in sys.argv:
             verify_unchanged_system_component()
         else:
             prepare_native()
+            if VERSION == '3.5.9':
+                verify_compatibility_update_scope()
         gradle(':app:assembleRelease', '--write-locks')
     unsigned = ROOT / 'app/build/outputs/apk/release/app-release-unsigned.apk'
     if not unsigned.is_file():

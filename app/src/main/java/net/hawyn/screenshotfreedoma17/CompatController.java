@@ -79,6 +79,7 @@ public final class CompatController {
     private static final AtomicBoolean REFRESH_PENDING = new AtomicBoolean();
     private static final AtomicBoolean FRAMEWORK_REFRESH_PENDING = new AtomicBoolean();
     private static final AtomicBoolean UPGRADE_RELOAD_REQUESTED = new AtomicBoolean();
+    private static final AtomicBoolean INSTALL_PENDING = new AtomicBoolean();
     private static final AtomicInteger CONFIG_REVISION = new AtomicInteger();
     private static volatile XposedService framework;
     private static volatile Context context;
@@ -121,6 +122,9 @@ public final class CompatController {
         synchronized (CompatController.class) {
             if (context == null) {
                 context = source.getApplicationContext().createDeviceProtectedStorageContext();
+                Diagnostics.initialize(context);
+                Diagnostics.record(context, "controller.start", "version=" + BuildConfig.VERSION_NAME
+                        + " code=" + BuildConfig.VERSION_CODE + " uid=" + android.os.Process.myUid());
                 local = context.getSharedPreferences(PREF_GROUP, Context.MODE_PRIVATE);
                 whiteTools = context.getSharedPreferences(WHITE_TOOL_GROUP, Context.MODE_PRIVATE);
                 blackTools = context.getSharedPreferences(BLACK_TOOL_GROUP, Context.MODE_PRIVATE);
@@ -148,6 +152,7 @@ public final class CompatController {
             XposedServiceHelper.registerListener(new XposedServiceHelper.OnServiceListener() {
                 @Override public void onServiceBind(XposedService service) {
                     framework = service;
+                    Diagnostics.record(context, "framework.bind", "Framework Binder received by trusted provider");
                     WORKER.execute(() -> {
                         syncRemote();
                         updateFrameworkStatus();
@@ -160,6 +165,7 @@ public final class CompatController {
                         frameworkLoaded = false;
                         configurationSynced = false;
                         frameworkStatus = "框架连接已断开";
+                        Diagnostics.record(context, "framework.died", frameworkStatus);
                     }
                 }
             });
@@ -233,6 +239,36 @@ public final class CompatController {
     public String getNativeDetails() { return nativeDetails; }
     public String getRecordingNativeDetails() { return recordingNativeDetails; }
     public String getRecordingPipeline() { return recordingPipeline; }
+    /** Read-only app observations; no Binder call, root request, or native command. */
+    public String diagnosticsSnapshot() {
+        JSONObject snapshot = new JSONObject();
+        try {
+            snapshot.put("version", BuildConfig.VERSION_NAME).put("version_code", BuildConfig.VERSION_CODE)
+                    .put("elapsed_realtime_ms", SystemClock.elapsedRealtime())
+                    .put("uid", android.os.Process.myUid()).put("required_system_version", REQUIRED_SYSTEM_VERSION)
+                    .put("framework_connected", framework != null).put("framework_loaded", frameworkLoaded)
+                    .put("configuration_synced", configurationSynced).put("framework_status", frameworkStatus)
+                    .put("framework_targets", lastTargets).put("upgrade_reload", upgradeReloadDetails)
+                    .put("operation_status", operationStatus)
+                    .put("secure_enabled", getSecureEnabled()).put("skip_enabled", getSkipEnabled())
+                    .put("arbitration_enabled", getArbitrationEnabled()).put("tool_mode", getCaptureToolMode())
+                    .put("native_active", nativeActive).put("native_known", nativeKnown)
+                    .put("native_matching", nativeMatching).put("native_operation_ok", nativeOperationOk)
+                    .put("native_capability_missing", nativeCapabilityMissing).put("native_details", nativeDetails)
+                    .put("recording_active", recordingNativeActive).put("recording_known", recordingNativeKnown)
+                    .put("recording_matching", recordingNativeMatching).put("recording_operation_ok", recordingNativeOperationOk)
+                    .put("recording_supported", recordingNativeSupported).put("recording_pipeline", recordingPipeline)
+                    .put("recording_capability_missing", recordingNativeCapabilityMissing).put("recording_details", recordingNativeDetails)
+                    .put("policy_running", policyRunning).put("policy_matching", policyMatching)
+                    .put("policy_known", policyKnown).put("policy_ready", policyReady)
+                    .put("policy_paused", policyPaused).put("policy_blockers", policyBlockers)
+                    .put("policy_details", policyDetails);
+            return snapshot.toString(2);
+        } catch (Exception error) {
+            Diagnostics.recordError(context, "controller.snapshot", error);
+            return snapshot.toString();
+        }
+    }
     public String getPolicyDetails() { return isPolicyMatching() ? COMPATIBILITY_MATCHING
             : isPolicyRunning() ? policyDetails : ARBITRATION_NOT_RUNNING; }
     public boolean isPolicyRunning() { return getArbitrationEnabled() && policyRunning; }
@@ -393,6 +429,14 @@ public final class CompatController {
                 readNativeStatus();
                 readRecordingNativeStatus();
                 readPolicyStatus();
+                if (Diagnostics.isEnabled(context)) {
+                    Diagnostics.recordState(context, "status.screenshot", nativeDetails + " active=" + nativeActive
+                            + " known=" + nativeKnown + " matching=" + nativeMatching + " ok=" + nativeOperationOk);
+                    Diagnostics.recordState(context, "status.recording", recordingNativeDetails + " active=" + recordingNativeActive
+                            + " known=" + recordingNativeKnown + " matching=" + recordingNativeMatching + " ok=" + recordingNativeOperationOk);
+                    Diagnostics.recordState(context, "status.policy", policyDetails + " running=" + policyRunning
+                            + " known=" + policyKnown + " ready=" + policyReady + " paused=" + policyPaused);
+                }
             } finally { REFRESH_PENDING.set(false); }
         });
     }
@@ -425,6 +469,7 @@ public final class CompatController {
             if (!whiteSynced || !blackSynced) {
                 configurationSynced = false;
                 frameworkStatus = "名单同步未完成，模式尚未切换";
+                Diagnostics.recordState(context, "framework.sync", frameworkStatus);
                 return;
             }
             boolean success = service.getRemotePreferences(PREF_GROUP).edit()
@@ -436,10 +481,14 @@ public final class CompatController {
                     .putString(KEY_TOOL_MODE, mode).commit();
             configurationSynced = success && revision == CONFIG_REVISION.get() && framework == service;
             if (!success) frameworkStatus = "配置同步未完成，请刷新状态";
+            Diagnostics.recordState(context, "framework.sync", "synced=" + configurationSynced + " revision=" + revision
+                    + " secure=" + local.getBoolean(KEY_SECURE, true) + " skip=" + local.getBoolean(KEY_SKIP, true)
+                    + " arbitration=" + local.getBoolean(KEY_ARBITRATION_ENABLED, DEFAULT_ARBITRATION_ENABLED) + " mode=" + mode);
         } catch (Throwable e) {
             configurationSynced = false;
             frameworkStatus = "配置同步失败：" + e.getClass().getSimpleName();
             Log.w(TAG, "Remote preference sync", e);
+            Diagnostics.recordError(context, "framework.sync", e);
         }
     }
 
@@ -489,15 +538,18 @@ public final class CompatController {
             if (!details.equals(lastTargets)) {
                 lastTargets = details;
                 Log.i(TAG, "Framework targets: " + details);
+                Diagnostics.recordState(context, "framework.targets", details);
             }
             frameworkStatus = name + (frameworkLoaded ? " · 系统模块已加载"
                     : previousVersion ? " · 系统仍运行旧版，请重新加载模块或重启"
                     : " · 系统模块待加载，请确认系统作用域并重启");
             if (!frameworkLoaded && !upgradeReloadDetails.isEmpty()) frameworkStatus += " · " + upgradeReloadDetails;
+            Diagnostics.recordState(context, "framework.status", frameworkStatus);
         } catch (Throwable e) {
             frameworkLoaded = false;
             frameworkStatus = "框架已连接 · 加载状态查询失败";
             Log.w(TAG, "Framework status", e);
+            Diagnostics.recordError(context, "framework.status", e);
         }
     }
 
@@ -524,6 +576,7 @@ public final class CompatController {
         } catch (Throwable e) {
             frameworkStatus = "系统模块更新待重启后加载";
             Log.w(TAG, "Upgrade reload", e);
+            Diagnostics.recordError(context, "framework.reload", e);
         }
     }
 
@@ -747,11 +800,15 @@ public final class CompatController {
             else if (!status.optBoolean("supported")) nativeDetails = "截图原生接口待核对：" + status.optString("reason");
             else if (!status.optBoolean("ok")) nativeDetails = "系统组件待处理：" + status.optString("reason");
             else nativeDetails = nativeActive ? "系统截图已包含被排除子层" : "已恢复系统子层排除规则";
+            if (Diagnostics.isEnabled(context) && (!nativeOperationOk || nativeCapabilityMissing)) {
+                Diagnostics.recordState(context, "native.screenshot.detail", statusDiagnosticDetails(status));
+            }
         } catch (Exception e) {
             nativeActive = false;
             nativeKnown = false;
             nativeOperationOk = false;
             nativeDetails = "系统组件状态读取失败：" + e.getClass().getSimpleName();
+            Diagnostics.recordError(context, "status.screenshot.read", e);
         }
     }
 
@@ -792,6 +849,9 @@ public final class CompatController {
             else recordingNativeDetails = recordingNativeActive
                     ? "录屏输出已包含被排除子层；请用实际视频验证"
                     : "已恢复录屏子层排除规则；请重新开始录屏";
+            if (Diagnostics.isEnabled(context) && (!recordingNativeOperationOk || recordingNativeCapabilityMissing)) {
+                Diagnostics.recordState(context, "native.recording.detail", statusDiagnosticDetails(status));
+            }
         } catch (Exception e) {
             recordingNativeActive = false;
             recordingNativeKnown = false;
@@ -799,6 +859,7 @@ public final class CompatController {
             recordingNativeSupported = false;
             recordingPipeline = "";
             recordingNativeDetails = "录屏状态读取失败：" + e.getClass().getSimpleName();
+            Diagnostics.recordError(context, "status.recording.read", e);
         }
     }
 
@@ -863,10 +924,25 @@ public final class CompatController {
                     && Boolean.FALSE.equals(status.opt("recording_managed"))) {
                 policyDetails += " · 图层处理未匹配，原系统规则保留";
             } else if ("partial".equals(status.optString("coverage"))) policyDetails += " · 部分图层管线支持";
+            if (!policyReady && Diagnostics.isEnabled(context)) Diagnostics.recordState(context, "native.policy.detail", statusDiagnosticDetails(status));
         } catch (Exception error) {
             policyDetails = ARBITRATION_NOT_RUNNING;
             Log.w(TAG, "Capture policy status unavailable", error);
+            Diagnostics.recordError(context, "status.policy.read", error);
         }
+    }
+
+    /** Keep fault evidence without turning heartbeat timestamps into log traffic. */
+    private static String statusDiagnosticDetails(JSONObject status) {
+        JSONObject detail = new JSONObject();
+        try {
+            for (String key : new String[]{"schema", "pipeline", "ok", "supported", "active", "active_known",
+                    "owned", "matching", "reason", "detail", "errno", "pid", "build_id", "site_offset",
+                    "running", "ready", "paused", "coverage", "file_access"}) {
+                if (status.has(key)) detail.put(key, status.opt(key));
+            }
+        } catch (Exception ignored) { /* The complete source status is also included by the exporter. */ }
+        return detail.toString();
     }
 
     private static boolean policyStatusRunning(JSONObject status, long age) throws Exception {
@@ -917,9 +993,20 @@ public final class CompatController {
 
     /** One-time installation needs root; ordinary toggles use the private config file. */
     public void installNativeAsync() {
+        if (!INSTALL_PENDING.compareAndSet(false, true)) {
+            operationStatus = "上次系统模块安装仍在执行，请等待完成后再试";
+            return;
+        }
         operationStatus = "正在安装系统组件，请留意 Root 授权提示";
         WORKER.execute(() -> {
             Process process = null;
+            InstallOutput output = null;
+            boolean resultRecorded = false;
+            boolean diagnostic = Diagnostics.isEnabled(context);
+            long started = SystemClock.elapsedRealtime();
+            String session = Long.toString(System.currentTimeMillis());
+            Diagnostics.recordInstall(context, "begin", "session=" + session + " version=" + BuildConfig.VERSION_NAME
+                    + " uid=" + android.os.Process.myUid() + " abis=" + java.util.Arrays.toString(Build.SUPPORTED_ABIS), false);
             try {
                 File stage = new File(context.getFilesDir(), "native-installer");
                 if (!stage.isDirectory() && !stage.mkdirs()) throw new IllegalStateException("staging directory");
@@ -939,17 +1026,72 @@ public final class CompatController {
                 writeRecordingNativeConfig();
                 writeArbitrationConfig();
                 String mod = quote(MODULE_DIR), src = quote(stage.getAbsolutePath());
-                String script = "set -eu\nMOD=" + mod + "\nSRC=" + src + "\n"
+                String script = "set -eu\nMOD=" + mod + "\nSRC=" + src + "\nDIAGNOSTIC=" + (diagnostic ? "1" : "0") + "\n"
+                        + "echo 'SF17FIX_INSTALL_BEGIN'\n"
+                        + (diagnostic ? "date '+%Y-%m-%dT%H:%M:%S%z' || true\nid || true\nuname -a || true\n" : "")
+                        + (diagnostic ? "installation_diagnostics() (\n"
+                        + " set +e\n echo '=== failure snapshot (read-only) ==='\n"
+                        + " date '+%Y-%m-%dT%H:%M:%S%z'; id; getenforce\n"
+                        + " echo '--- relevant processes ---'\n"
+                        + " ps -A -o USER,PID,PPID,STAT,NAME,ARGS 2>&1 | grep -E 'surfaceflinger|sf17fix|enable_screenshot17fix|screenshotfreedoma17'\n"
+                        + " echo '--- module and ownership metadata ---'\n"
+                        + " ls -ldZ \"$MOD\" \"$MOD/bin\" /data/adb/enable_screenshot17fix 2>&1\n"
+                        + " ls -lZ \"$MOD/daemon.pid\" \"$MOD/broker.pid\" \"$MOD/bin/sf17fix\" \"$MOD/disable\" \"$MOD/remove\" /data/adb/enable_screenshot17fix/native.lock /data/adb/enable_screenshot17fix/native-patch.state /data/adb/enable_screenshot17fix/native-recording-patch.state 2>&1\n"
+                        + " echo '--- native.lock ownership (existing /proc/locks only) ---'\n"
+                        + " diagnostic_lock_inode=$(stat -c '%i' /data/adb/enable_screenshot17fix/native.lock 2>/dev/null)\n"
+                        + " case \"$diagnostic_lock_inode\" in ''|*[!0-9]*) echo 'native.lock inode unavailable' ;; *)\n"
+                        + "  awk -v inode=\"$diagnostic_lock_inode\" '{ for (i = 1; i <= NF; i++) if ($i ~ /^[[:xdigit:]]+:[[:xdigit:]]+:[0-9]+$/) { n = split($i, parts, \":\"); if ((\"x\" parts[n]) == (\"x\" inode)) { print; break } } }' /proc/locks 2>&1 | head -c 32768\n"
+                        + " ;; esac; echo\n"
+                        + " for name in module.prop daemon.pid broker.pid status.json recording-status.json policy-status.json; do\n"
+                        + "  echo \"--- $name ---\"; head -c 16384 \"$MOD/$name\" 2>&1; echo\n done\n"
+                        + " for name in daemon.pid broker.pid; do\n"
+                        + "  diagnostic_pid=$(awk 'NR == 1 { print $1; exit }' \"$MOD/$name\" 2>/dev/null)\n"
+                        + "  case \"$diagnostic_pid\" in ''|*[!0-9]*) ;; *)\n"
+                        + "   echo \"--- /proc/$diagnostic_pid identity ---\"\n"
+                        + "   diagnostic_cmdline=$(tr '\\000' ' ' < \"/proc/$diagnostic_pid/cmdline\" 2>/dev/null)\n"
+                        + "   case \"$diagnostic_cmdline\" in *\"$MOD/\"*)\n"
+                        + "   printf '%s\\n' \"$diagnostic_cmdline\"\n"
+                        + "   head -c 8192 \"/proc/$diagnostic_pid/status\" 2>&1; echo\n"
+                        + "   cat \"/proc/$diagnostic_pid/stat\" 2>&1; echo\n"
+                        + "   ls -l \"/proc/$diagnostic_pid/fd\" 2>&1 | head -c 16384; echo\n"
+                        + "   ;; *) echo 'PID identity mismatch; process details omitted' ;; esac\n"
+                        + "  ;; esac\n done\n"
+                        + " echo '--- recent module stderr / daemon log ---'\n"
+                        + " tail -n 180 \"$MOD/daemon.log\" 2>&1 | tail -c 65536; echo\n"
+                        + " echo '=== end failure snapshot ==='\n)\n" : "installation_diagnostics() { :; }\n")
                         + "if [ -f \"$MOD/module.prop\" ]; then grep -qx 'id=enable_screenshot17fix' \"$MOD/module.prop\"; fi\n"
+                        + "[ ! -L \"$MOD\" ] && [ ! -L \"$MOD/bin\" ] && [ ! -L \"$MOD/module.prop\" ] || { echo 'SF17FIX_INSTALL_FAILED: unexpected module path type'; exit 1; }\n"
                         + "mkdir -p \"$MOD/bin\"\n"
-                        + "fail_install() { echo \"SF17FIX_INSTALL_FAILED: $1\"; exit 1; }\n"
+                        + "fail_install() { echo \"SF17FIX_INSTALL_FAILED: $1\"; installation_diagnostics || true; exit 1; }\n"
                         + "is_service() { [ -r \"/proc/$1/cmdline\" ] && tr '\\000' ' ' < \"/proc/$1/cmdline\" | grep -Fq \"$MOD/service.sh\"; }\n"
-                        + "is_inactive() { printf '%s\\n' \"$1\" | grep -Eq '\"ok\"[[:space:]]*:[[:space:]]*true' && printf '%s\\n' \"$1\" | grep -Eq '\"active_known\"[[:space:]]*:[[:space:]]*true' && printf '%s\\n' \"$1\" | grep -Eq '\"active\"[[:space:]]*:[[:space:]]*false'; }\n"
+                        + "is_inactive() { printf '%s\\n' \"$1\" | grep -Eq '\"ok\"[[:space:]]*:[[:space:]]*true[[:space:]]*[,}]' && printf '%s\\n' \"$1\" | grep -Eq '\"active_known\"[[:space:]]*:[[:space:]]*true[[:space:]]*[,}]' && printf '%s\\n' \"$1\" | grep -Eq '\"active\"[[:space:]]*:[[:space:]]*false[[:space:]]*[,}]'; }\n"
                         + "capability_absent() { [ ! -e \"$2\" ] && [ ! -L \"$2\" ] && printf '%s\\n' \"$1\" | grep -Eq '\"supported\"[[:space:]]*:[[:space:]]*false' && printf '%s\\n' \"$1\" | grep -Eq '\"reason\"[[:space:]]*:[[:space:]]*\"(signature_not_found|signature_ambiguous|unsupported_[a-z0-9_]+)\"'; }\n"
+                        + "STATE=/data/adb/enable_screenshot17fix/native-patch.state\n"
+                        + "RECORD_STATE=/data/adb/enable_screenshot17fix/native-recording-patch.state\n"
+                        + "RECOVERY=\"$MOD/bin/sf17fix.recovery.$$\"\n"
+                        + "(umask 077; set -C; cat \"$SRC/sf17fix\" > \"$RECOVERY\") || fail_install 'cannot stage verified restoration tool'\n"
+                        + "trap 'rm -f \"$RECOVERY\"' EXIT\nchmod 700 \"$RECOVERY\"\n"
+                        + "native_command() { if [ \"$DIAGNOSTIC\" = 1 ]; then \"$1\" \"$2\" 2>>\"$MOD/daemon.log\"; else \"$1\" \"$2\" 2>/dev/null; fi; }\n"
+                        + "confirmed_restore() { [ ! -e \"$2\" ] && [ ! -L \"$2\" ] && { { [ \"$3\" = 0 ] && is_inactive \"$1\"; } || capability_absent \"$1\" \"$2\"; }; }\n"
+                        + "restore_pipeline() {\n restore_command=$1; restore_state=$2\n restore_code=127; restored=''\n"
+                        + " if [ -x \"$MOD/bin/sf17fix\" ] && [ ! -L \"$MOD/bin/sf17fix\" ]; then\n"
+                        + "  restore_code=0; restored=$(native_command \"$MOD/bin/sf17fix\" \"$restore_command\") || restore_code=$?\n"
+                        + "  printf 'SF17FIX_COMMAND old-%s exit=%s\\n%s\\n' \"$restore_command\" \"$restore_code\" \"$restored\"\n"
+                        + "  if confirmed_restore \"$restored\" \"$restore_state\" \"$restore_code\"; then return 0; fi\n fi\n"
+                        + " restore_code=0; restored=$(native_command \"$RECOVERY\" \"$restore_command\") || restore_code=$?\n"
+                        + " printf 'SF17FIX_COMMAND verified-recovery-%s exit=%s\\n%s\\n' \"$restore_command\" \"$restore_code\" \"$restored\"\n"
+                        + " confirmed_restore \"$restored\" \"$restore_state\" \"$restore_code\"\n}\n"
+                        + "stop_attempted=0\n"
+                        + "if [ -f \"$MOD/service.sh\" ] && [ ! -L \"$MOD/service.sh\" ] && grep -Fq 'if [ \"$1\" = --stop ]; then' \"$MOD/service.sh\"; then\n"
+                        + " stop_attempted=1; stop_code=0\n sh \"$MOD/service.sh\" --stop >/dev/null 2>&1 || stop_code=$?\n"
+                        + " printf 'SF17FIX_COMMAND old-service-stop exit=%s\\n' \"$stop_code\"\n"
+                        + " # A restore error is checked independently below with the new helper.\n"
+                        + " # A live broker still holds native.lock and makes verified recovery fail.\nfi\n"
                         + "if [ -f \"$MOD/daemon.pid\" ]; then\n"
                         + " oldpid=$(cat \"$MOD/daemon.pid\")\n"
                         + " case \"$oldpid\" in *[!0-9]*|'') ;; *)\n"
                         + "  if is_service \"$oldpid\"; then\n"
+                        + "   [ \"$stop_attempted\" = 0 ] || fail_install 'old service is still running after its stop deadline'\n"
                         + "   kill -TERM \"$oldpid\" || fail_install 'old service termination failed'\n"
                         + "   waiting=0\n"
                         + "   while is_service \"$oldpid\"; do\n"
@@ -958,25 +1100,8 @@ public final class CompatController {
                         + "    waiting=$((waiting + 1))\n"
                         + "   done\n"
                         + "  fi ;; esac\nfi\n"
-                        + "STATE=/data/adb/enable_screenshot17fix/native-patch.state\n"
-                        + "RECORD_STATE=/data/adb/enable_screenshot17fix/native-recording-patch.state\n"
-                        + "if [ -x \"$MOD/bin/sf17fix\" ]; then\n"
-                        + " screenshot_code=0\n"
-                        + " restored=$(\"$MOD/bin/sf17fix\" disable 2>>\"$MOD/daemon.log\") || screenshot_code=$?\n"
-                        + " if [ \"$screenshot_code\" = 0 ] && is_inactive \"$restored\"; then :\n"
-                        + " elif capability_absent \"$restored\" \"$STATE\"; then :\n"
-                        + " else fail_install 'old screenshot restoration is unconfirmed'; fi\n"
-                        + " record_status=$(\"$MOD/bin/sf17fix\" record-status 2>>\"$MOD/daemon.log\") || true\n"
-                        + " if printf '%s\\n' \"$record_status\" | grep -Eq '\"reason\"[[:space:]]*:[[:space:]]*\"usage\"'; then\n"
-                        + "  [ ! -e \"$RECORD_STATE\" ] && [ ! -L \"$RECORD_STATE\" ] || fail_install 'recording ownership requires a compatible restore tool'\n"
-                        + " else\n"
-                        + "  record_code=0\n"
-                        + "  restored=$(\"$MOD/bin/sf17fix\" record-disable 2>>\"$MOD/daemon.log\") || record_code=$?\n"
-                        + "  if [ \"$record_code\" = 0 ] && is_inactive \"$restored\"; then :\n"
-                        + "  elif capability_absent \"$restored\" \"$RECORD_STATE\"; then :\n"
-                        + "  else fail_install 'old recording restoration is unconfirmed'; fi\n"
-                        + " fi\n"
-                        + "fi\n"
+                        + "restore_pipeline disable \"$STATE\" || fail_install 'old screenshot restoration is unconfirmed after verified recovery'\n"
+                        + "restore_pipeline record-disable \"$RECORD_STATE\" || fail_install 'old recording restoration is unconfirmed after verified recovery'\n"
                         + "[ ! -e \"$STATE\" ] && [ ! -L \"$STATE\" ] && [ ! -e \"$RECORD_STATE\" ] && [ ! -L \"$RECORD_STATE\" ] || fail_install 'owned changes remain pending'\n"
                         + "rm -f \"$MOD/daemon.pid\"\n"
                         + "cp \"$SRC/sf17fix\" \"$MOD/bin/sf17fix.new\"\n"
@@ -992,19 +1117,30 @@ public final class CompatController {
                         + "rm -f \"$MOD/disable\" \"$MOD/remove\"\n"
                         + "nohup sh \"$MOD/service.sh\" >/dev/null 2>&1 </dev/null &\n"
                         + "echo SF17FIX_INSTALL_OK\n";
+                if (diagnostic) Diagnostics.record(context, "install.script", "session=" + session + "\n" + script);
                 process = new ProcessBuilder("su", "-c", "sh").redirectErrorStream(true).start();
+                // Drain while the command runs: diagnostic output must never fill
+                // the pipe and block the restore operation being diagnosed.
+                output = new InstallOutput(process.getInputStream(), diagnostic);
+                output.start();
                 try (var stream = process.getOutputStream()) {
                     stream.write(script.getBytes(StandardCharsets.UTF_8));
                 }
-                if (!process.waitFor(60, TimeUnit.SECONDS)) {
-                    process.destroyForcibly();
-                    throw new IllegalStateException("Root 授权或安装等待超时");
+                if (!process.waitFor(180, TimeUnit.SECONDS)) {
+                    output.await();
+                    Diagnostics.recordInstall(context, "timeout", "session=" + session + " elapsed_ms="
+                            + (SystemClock.elapsedRealtime() - started) + "\n" + output.text(), true);
+                    resultRecorded = true;
+                    throw new IllegalStateException("安装等待超时，后台恢复操作将继续完成，请勿重复安装");
                 }
-                String result;
-                try (InputStream stream = process.getInputStream()) {
-                    result = readText(stream, 65_536);
-                }
-                if (process.exitValue() != 0 || !result.contains("SF17FIX_INSTALL_OK")) {
+                output.await();
+                String result = output.text();
+                boolean installed = process.exitValue() == 0 && result.contains("SF17FIX_INSTALL_OK");
+                Diagnostics.recordInstall(context, "complete", "session=" + session + " exit=" + process.exitValue()
+                        + " elapsed_ms=" + (SystemClock.elapsedRealtime() - started) + " success=" + installed
+                        + "\n" + result, !installed);
+                resultRecorded = true;
+                if (!installed) {
                     String failure = "Root 未授权，或系统组件安装未完成";
                     for (String line : result.split("\\r?\\n")) {
                         if (line.startsWith("SF17FIX_INSTALL_FAILED:")) { failure = line; break; }
@@ -1016,11 +1152,103 @@ public final class CompatController {
                 requestStatusRefresh();
                 operationStatus = "";
             } catch (Throwable e) {
+                if (!resultRecorded) Diagnostics.recordInstall(context, "exception", "session=" + session + " elapsed_ms="
+                        + (SystemClock.elapsedRealtime() - started) + "\n" + Log.getStackTraceString(e)
+                        + (output == null ? "" : "\n" + output.text()), true);
                 report(e);
             } finally {
-                if (process != null && process.isAlive()) process.destroyForcibly();
+                if (process != null && process.isAlive() && output != null) {
+                    // Do not kill a native restore while it may hold stopped SurfaceFlinger
+                    // threads. Keep draining its bounded output and block duplicate installs.
+                    observePendingInstall(process, output, session, started);
+                } else {
+                    if (output != null) output.close();
+                    INSTALL_PENDING.set(false);
+                }
             }
         });
+    }
+
+    private static void observePendingInstall(Process process, InstallOutput output, String session, long started) {
+        Thread observer = new Thread(() -> {
+            try {
+                process.waitFor();
+                output.await();
+                String result = output.text();
+                boolean installed = process.exitValue() == 0 && result.contains("SF17FIX_INSTALL_OK");
+                Diagnostics.recordInstall(context, "background-complete", "session=" + session + " exit="
+                        + process.exitValue() + " elapsed_ms=" + (SystemClock.elapsedRealtime() - started)
+                        + " success=" + installed + "\n" + result, !installed);
+                operationStatus = installed ? "系统组件已安装，正在等待状态更新" : "后台安装已结束，请查看日志后重试";
+                requestStatusRefresh();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            } finally {
+                output.close();
+                INSTALL_PENDING.set(false);
+            }
+        }, "ScreenshotCompat-install-completion");
+        observer.setDaemon(true);
+        observer.start();
+    }
+
+    /** Bounded head/tail capture; consuming continues even after the memory limit. */
+    private static final class InstallOutput {
+        private final int headLimit;
+        private final InputStream input;
+        private final ByteArrayOutputStream head = new ByteArrayOutputStream();
+        private final byte[] tail;
+        private int tailLength;
+        private int tailPosition;
+        private long total;
+        private String readError = "";
+        private final Thread reader;
+
+        InstallOutput(InputStream input, boolean diagnostic) {
+            this.input = input;
+            headLimit = diagnostic ? 393_216 : 8_192;
+            tail = new byte[diagnostic ? 131_072 : 8_192];
+            reader = new Thread(() -> {
+                try {
+                    byte[] buffer = new byte[4096];
+                    int count;
+                    while ((count = input.read(buffer)) != -1) append(buffer, count);
+                } catch (Exception error) {
+                    synchronized (this) { readError = diagnostic ? Log.getStackTraceString(error) : error.toString(); }
+                }
+            }, "ScreenshotCompat-install-output");
+            reader.setDaemon(true);
+        }
+
+        void start() { reader.start(); }
+        void await() throws InterruptedException { reader.join(2000); }
+        void close() { try { input.close(); } catch (Exception ignored) { } }
+
+        private synchronized void append(byte[] data, int count) {
+            int prefix = Math.min(count, headLimit - head.size());
+            if (prefix > 0) head.write(data, 0, prefix);
+            for (int i = prefix; i < count; i++) {
+                tail[tailPosition] = data[i];
+                tailPosition = (tailPosition + 1) % tail.length;
+                if (tailLength < tail.length) tailLength++;
+            }
+            total += count;
+        }
+
+        synchronized String text() {
+            ByteArrayOutputStream captured = new ByteArrayOutputStream();
+            byte[] headBytes = head.toByteArray();
+            captured.write(headBytes, 0, headBytes.length);
+            long omitted = total - head.size() - tailLength;
+            if (omitted > 0) {
+                byte[] marker = ("\n[" + omitted + " output bytes omitted; tail follows]\n").getBytes(StandardCharsets.UTF_8);
+                captured.write(marker, 0, marker.length);
+            }
+            int start = tailLength == tail.length ? tailPosition : 0;
+            for (int i = 0; i < tailLength; i++) captured.write(tail[(start + i) % tail.length]);
+            String text = new String(captured.toByteArray(), StandardCharsets.UTF_8);
+            return readError.isEmpty() ? text : text + "\n[output reader error]\n" + readError;
+        }
     }
 
     private static void copyAsset(String name, File destination) throws Exception {
@@ -1048,5 +1276,6 @@ public final class CompatController {
         operationStatus = "操作未完成：" + (error.getMessage() == null
                 ? error.getClass().getSimpleName() : error.getMessage());
         Log.w(TAG, "Configuration operation", error);
+        Diagnostics.recordError(context, "controller.operation", error);
     }
 }

@@ -37,6 +37,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/sysmacros.h>
+#include <sys/vfs.h>
 #include <sys/wait.h>
 #endif
 #include <unistd.h>
@@ -177,6 +178,11 @@ public:
 };
 struct NativeMetrics {
     std::string discoveryCache = "none";
+    std::string accessCache = "none", accessCacheDetail, selectedAccess;
+    // Bounded diagnostics only; no file content or per-poll ELF hashing.
+    std::vector<std::string> moduleAccess;
+    size_t accessDiagnosticBytes = 0;
+    bool accessDiagnosticsTruncated = false;
     double discoveryMs = 0, ownershipPrepareMs = 0, stoppedMs = 0, totalMs = 0;
     uint64_t moduleReadBytes = 0, liveReadBytes = 0, stoppedThreads = 0;
 };
@@ -2247,30 +2253,106 @@ std::string processExe(pid_t pid) {
     if (result.front() != '/' || result.ends_with(" (deleted)")) throw Error("unsupported_module_maps", "Executable has no stable file identity");
     return result;
 }
+enum class AccessRoute : uint32_t { ProcExe = 1, MapFile = 2, ProcRoot = 3, Absolute = 4 };
+const char* accessRouteName(AccessRoute route) {
+    switch (route) {
+        case AccessRoute::ProcExe: return "proc_exe";
+        case AccessRoute::MapFile: return "exact_map_file";
+        case AccessRoute::ProcRoot: return "proc_root_strict";
+        case AccessRoute::Absolute: return "absolute_strict";
+    }
+    return "invalid";
+}
+bool validAccessRoute(uint32_t route) { return route >= 1 && route <= 4; }
+struct AccessHint { AccessRoute route = AccessRoute::ProcRoot; Digest digest{}; };
+using AccessHints = std::map<std::string, AccessHint>;
+struct ProcessDirectory {
+    Fd fd;
+    pid_t pid;
+    uint64_t start;
+    std::string epoch;
+    explicit ProcessDirectory(pid_t id, const std::string& expectedEpoch) : pid(id), start(processStart(id)), epoch(expectedEpoch) {
+        // Only these verified procfs directories may supply magic-link proof.
+        // Never follow a caller-controlled symlink and call it a mapped handle.
+        Fd proc(open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+        struct stat st{}; struct statfs fs{};
+        if (proc.value < 0 || fstatfs(proc.value, &fs) || uint64_t(fs.f_type) != 0x9fa0 ||
+            fstat(proc.value, &st) || !S_ISDIR(st.st_mode) || st.st_uid != 0)
+            throw Error("untrusted_procfs", "Mapped-file proof requires root-owned procfs");
+        fd.value = openat(proc.value, std::to_string(pid).c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (fd.value < 0 || fstatfs(fd.value, &fs) || uint64_t(fs.f_type) != 0x9fa0 ||
+            fstat(fd.value, &st) || !S_ISDIR(st.st_mode))
+            throw Error("untrusted_procfs", "Cannot bind the SurfaceFlinger procfs directory");
+        if (processStart(pid) != start) throw Error("process_changed", "PID changed while opening procfs directory");
+    }
+};
+struct ModuleReadIdentity { std::optional<Digest> digest; };
 struct ModuleFile {
     MappedRange identity;
     std::vector<MappedRange> maps;
     std::string openedPath, stamp;
+    AccessRoute route = AccessRoute::ProcRoot;
+    bool cachedRoute = false;
+    std::optional<Digest> cachedDigest;
+    std::shared_ptr<ProcessDirectory> process;
+    std::shared_ptr<ModuleReadIdentity> readIdentity = std::make_shared<ModuleReadIdentity>();
 };
 std::string fileStamp(const struct stat& s) {
     std::ostringstream o;
     o << uint64_t(s.st_dev) << ':' << s.st_ino << ':' << s.st_size << ':' << s.st_mtim.tv_sec << ':' << s.st_mtim.tv_nsec
-      << ':' << s.st_ctim.tv_sec << ':' << s.st_ctim.tv_nsec;
+      << ':' << s.st_ctim.tv_sec << ':' << s.st_ctim.tv_nsec
+      << ':' << s.st_mode << ':' << s.st_uid << ':' << s.st_gid;
     return o.str();
 }
 void validateModuleStat(const ModuleFile& module, const struct stat& s) {
-    if (!S_ISREG(s.st_mode) || uint64_t(s.st_ino) != module.identity.inode ||
-        unsigned(major(s.st_dev)) != module.identity.major || unsigned(minor(s.st_dev)) != module.identity.minor)
+    if (!S_ISREG(s.st_mode) || s.st_size <= 0 || uint64_t(s.st_size) > kMaxElf)
+        throw Error("unsupported_module_elf", "Mapped ELF is not a bounded regular file: " + module.identity.path);
+    // maps uses the kernel's file-user-inode identity. Stacked filesystems may
+    // expose another getattr identity even on the exact mapped-file FD. Only a
+    // trusted procfs magic link binds that FD to the mapping independently.
+    bool mappedHandle = module.route == AccessRoute::ProcExe || module.route == AccessRoute::MapFile;
+    if (!mappedHandle && (uint64_t(s.st_ino) != module.identity.inode ||
+        unsigned(major(s.st_dev)) != module.identity.major || unsigned(minor(s.st_dev)) != module.identity.minor))
         throw Error("module_identity_changed", "Mapped path device/inode differs from opened ELF: " + module.identity.path);
 }
+std::string procLink(const ModuleFile& module, const std::string& name) {
+    std::array<char, 4096> text{};
+    ssize_t n = readlinkat(module.process->fd.value, name.c_str(), text.data(), text.size());
+    if (n <= 0 || size_t(n) == text.size()) fail("module_read_denied", "Cannot resolve mapped procfs link: " + name);
+    return std::string(text.data(), size_t(n));
+}
+std::string mapFileName(const ModuleFile& module) {
+    std::ostringstream name;
+    name << "map_files/" << std::hex << module.identity.lo << '-' << module.identity.hi;
+    return name.str();
+}
+int openModule(const ModuleFile& module) {
+    if (!module.process || module.process->fd.value < 0)
+        throw Error("untrusted_procfs", "Missing verified process directory");
+    int descriptor = -1;
+    if (module.route == AccessRoute::ProcExe || module.route == AccessRoute::MapFile) {
+        std::string link = module.route == AccessRoute::ProcExe ? "exe" : mapFileName(module);
+        if (procLink(module, link) != module.identity.path)
+            throw Error("module_identity_changed", "Kernel mapped-file link no longer names the selected logical ELF");
+        // Deliberately follow ONLY this generated, procfs-verified magic link.
+        // O_NOFOLLOW is required for ordinary paths, but would reject proc links.
+        descriptor = openat(module.process->fd.value, link.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    } else if (module.route == AccessRoute::ProcRoot) {
+        descriptor = openat(module.process->fd.value, ("root" + module.identity.path).c_str(),
+                            O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+    } else if (module.route == AccessRoute::Absolute) {
+        descriptor = open(module.identity.path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+    } else throw Error("invalid_compat_cache", "Unknown mapped-file access strategy");
+    if (descriptor < 0) fail("module_read_denied", "Cannot open mapped ELF using " + std::string(accessRouteName(module.route)));
+    return descriptor;
+}
 std::string currentStamp(const ModuleFile& module) {
-    struct stat st{};
-    if (stat(module.openedPath.c_str(), &st)) fail("module_read_denied", "Cannot inspect mapped ELF: " + module.identity.path);
+    Fd fd(openModule(module)); struct stat st{};
+    if (fstat(fd.value, &st)) fail("module_read_denied", "Cannot inspect mapped ELF: " + module.identity.path);
     validateModuleStat(module, st); return fileStamp(st);
 }
 std::vector<uint8_t> readModule(const ModuleFile& module) {
-    Fd fd(open(module.openedPath.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
-    if (fd.value < 0) fail("module_read_denied", "Cannot open mapped ELF: " + module.identity.path);
+    Fd fd(openModule(module));
     struct stat before{}, after{};
     if (fstat(fd.value, &before)) fail("module_read_denied", "Cannot inspect opened mapped ELF");
     validateModuleStat(module, before);
@@ -2278,28 +2360,104 @@ std::vector<uint8_t> readModule(const ModuleFile& module) {
     if (before.st_size <= 0 || uint64_t(before.st_size) > kMaxElf) throw Error("unsupported_module_elf", "Mapped ELF exceeds supported file-size bounds");
     std::vector<uint8_t> bytes(size_t(before.st_size)); size_t done = 0;
     while (done < bytes.size()) {
-        ssize_t count = read(fd.value, bytes.data() + done, bytes.size() - done);
+        ssize_t count = pread(fd.value, bytes.data() + done, bytes.size() - done, off_t(done));
         if (count <= 0) fail("module_read_failed", "Short mapped ELF read");
         done += size_t(count);
     }
     if (fstat(fd.value, &after) || fileStamp(after) != module.stamp)
         throw Error("module_identity_changed", "Mapped ELF changed while reading");
+    validateModuleStat(module, after);
     gMetrics.moduleReadBytes += bytes.size();
+    module.readIdentity->digest = strongDigest(bytes.data(), bytes.size());
+    if (module.cachedDigest && *module.cachedDigest != *module.readIdentity->digest) {
+        // A route hint is not an ELF proof. A system update may leave the same
+        // access route usable, but the old semantic descriptor must miss and
+        // the complete decoder/live-code/ownership checks still run below.
+        gMetrics.accessCache = "stale_elf";
+        gMetrics.accessCacheDetail = "ELF changed; revalidating semantic proof: " + module.identity.path;
+    }
     return bytes;
+}
+AccessHints& accessHints();
+void saveAccessHints(const std::vector<ModuleFile>& inventory);
+std::string accessIdentity(const MappedRange& identity) {
+    std::ostringstream out; out << std::hex << identity.major << ':' << identity.minor << std::dec << ':' << identity.inode; return out.str();
+}
+std::string accessIdentity(const struct stat& s) {
+    std::ostringstream out; out << std::hex << major(s.st_dev) << ':' << minor(s.st_dev) << std::dec << ':' << s.st_ino; return out.str();
+}
+void accessDiagnostic(const ModuleFile& module, const std::string& stage, const struct stat* observed, const Error* error = nullptr) {
+    if (gMetrics.accessDiagnosticsTruncated || gMetrics.moduleAccess.size() >= 128) {
+        gMetrics.accessDiagnosticsTruncated = true; return;
+    }
+    std::ostringstream out;
+    out << "{\"path\":" << quote(module.identity.path) << ",\"strategy\":" << quote(accessRouteName(module.route))
+        << ",\"cached_strategy\":" << (module.cachedRoute ? "true" : "false")
+        << ",\"stage\":" << quote(stage) << ",\"maps_identity\":" << quote(accessIdentity(module.identity))
+        << ",\"file_identity\":" << quote(observed ? accessIdentity(*observed) : "")
+        << ",\"dual_identity\":" << ((observed && accessIdentity(*observed) != accessIdentity(module.identity)) ? "true" : "false")
+        // Legacy companion scripts select the top-level reason with sed/grep.
+        // Keep diagnostic names distinct so a failed attempt cannot impersonate
+        // the authoritative pipeline result in those deployed parsers.
+        << ",\"access_reason\":" << quote(error ? error->reason : "verified")
+        << ",\"access_detail\":" << quote(error ? error->what() : "") << ",\"access_errno\":" << (error ? error->err : 0) << '}';
+    auto encoded = out.str();
+    // Status consumers also run without diagnostics enabled and cap reads at
+    // 64 KiB. Budget the *encoded* bytes, including escaping and separators.
+    constexpr size_t budget = 12 * 1024;
+    size_t added = encoded.size() + (gMetrics.moduleAccess.empty() ? 0 : 1);
+    if (added > budget - gMetrics.accessDiagnosticBytes) {
+        gMetrics.accessDiagnosticsTruncated = true; return;
+    }
+    gMetrics.accessDiagnosticBytes += added;
+    gMetrics.moduleAccess.push_back(std::move(encoded));
 }
 std::vector<ModuleFile> moduleInventory(pid_t pid, const std::vector<MappedRange>& maps) {
     std::vector<ModuleFile> out;
+    auto epoch = mappingEpoch(maps);
+    auto process = std::make_shared<ProcessDirectory>(pid, epoch);
+    auto& hints = accessHints();
     for (const auto& m : maps) if (m.permissions[2] == 'x' && m.path != "[vdso]") {
         if (m.path.empty() || m.path.front() != '/' || m.path.ends_with(" (deleted)") || !m.inode)
             throw Error("unsupported_module_maps", "Executable anonymous/deleted mapping prevents a complete ELF audit");
         if (std::any_of(out.begin(), out.end(), [&](const auto& x) { return sameModule(x.identity, m); })) continue;
         if (out.size() == 1024) throw Error("unsupported_module_maps", "Executable module inventory exceeds audit bound");
-        ModuleFile module; module.identity = m;
-        module.openedPath = "/proc/" + std::to_string(pid) + "/root" + m.path;
+        ModuleFile module; module.identity = m; module.process = process;
         for (const auto& r : maps) if (sameModule(m, r)) module.maps.push_back(r);
-        module.stamp = currentStamp(module); out.push_back(std::move(module));
+        std::vector<AccessRoute> routes;
+        auto hint = hints.find(m.path);
+        if (hint != hints.end()) { routes.push_back(hint->second.route); module.cachedDigest = hint->second.digest; }
+        for (auto route : {AccessRoute::ProcExe, AccessRoute::MapFile, AccessRoute::ProcRoot, AccessRoute::Absolute})
+            if (std::find(routes.begin(), routes.end(), route) == routes.end()) routes.push_back(route);
+        bool accepted = false; std::string failure;
+        for (auto route : routes) {
+            module.route = route; module.cachedRoute = hint != hints.end() && route == hint->second.route;
+            // The executable link is a candidate only for the kernel's actual
+            // main executable; DSO mappings use exact map_files handles.
+            struct stat st{}; bool observed = false;
+            try {
+                if (route == AccessRoute::ProcExe && procLink(module, "exe") != m.path) continue;
+                Fd fd(openModule(module));
+                if (fstat(fd.value, &st)) fail("module_read_denied", "Cannot inspect access-strategy FD");
+                observed = true; validateModuleStat(module, st);
+                module.stamp = fileStamp(st);
+                module.openedPath = route == AccessRoute::ProcExe ? "/proc/" + std::to_string(pid) + "/exe" :
+                    route == AccessRoute::MapFile ? "/proc/" + std::to_string(pid) + "/" + mapFileName(module) :
+                    route == AccessRoute::ProcRoot ? "/proc/" + std::to_string(pid) + "/root" + m.path : m.path;
+                accessDiagnostic(module, "selected", &st); accepted = true;
+                if (hint != hints.end() && !module.cachedRoute) gMetrics.accessCache = "fallback";
+                break;
+            } catch (const Error& e) {
+                accessDiagnostic(module, "rejected", observed ? &st : nullptr, &e);
+                if (failure.size() < 4096) failure += std::string(accessRouteName(route)) + ": " + e.reason + " (" + std::to_string(e.err) + "); ";
+            }
+        }
+        if (!accepted) throw Error("module_identity_changed", "No verified mapped ELF access strategy for " + m.path + ": " + failure);
+        out.push_back(std::move(module));
     }
     if (out.empty()) throw Error("maps_mismatch", "No file-backed executable ELF candidates");
+    if (processStart(pid) != process->start || mappingEpoch(parseMaps(readMaps(pid))) != epoch)
+        throw Error("process_changed", "Process/mapping epoch changed while selecting mapped-file access strategies");
     return out;
 }
 bool privateMetadata(const struct stat& s, bool directory) {
@@ -2327,6 +2485,113 @@ const Digest& programDigest() {
         if(fstat(fd.value,&after) || fileStamp(before)!=fileStamp(after))throw Error("compat_cache_io","Decoder executable changed while hashing");
         return strongDigest(bytes.data(),bytes.size());
     }();return digest;
+}
+// This descriptor remembers *how* a verified mapped file can be read. It never
+// grants patch capability, replaces the decoder proof, stores a live address,
+// or permits an ordinary pathname to bypass maps device/inode comparison.
+constexpr uint64_t kAccessCacheMagic = 0x3153434341584653ULL; // SFXACCS1
+std::vector<uint8_t> encodeAccessHints(const AccessHints& hints, const Digest& program) {
+    if (hints.empty() || hints.size() > 1024) throw Error("invalid_access_cache", "Access descriptor inventory count invalid");
+    std::vector<uint8_t> out;
+    auto number = [&](uint64_t n, unsigned width) { for (unsigned i = 0; i < width; ++i) out.push_back(uint8_t(n >> (8 * i))); };
+    number(kAccessCacheMagic, 8); number(1, 4); out.insert(out.end(), program.begin(), program.end()); number(hints.size(), 4);
+    for (const auto& [path, hint] : hints) {
+        if (path.empty() || path.front() != '/' || path.size() > 4096 || path.find('\0') != std::string::npos ||
+            path.ends_with(" (deleted)") || !validAccessRoute(uint32_t(hint.route)))
+            throw Error("invalid_access_cache", "Access descriptor entry invalid");
+        number(path.size(), 4); out.insert(out.end(), path.begin(), path.end()); number(uint32_t(hint.route), 4);
+        out.insert(out.end(), hint.digest.begin(), hint.digest.end());
+    }
+    if (out.size() > kMaxCompatibilityRecord - 32) throw Error("invalid_access_cache", "Access descriptor too large");
+    auto digest = strongDigest(out.data(), out.size()); out.insert(out.end(), digest.begin(), digest.end()); return out;
+}
+AccessHints decodeAccessHints(const std::vector<uint8_t>& bytes, const Digest& program) {
+    if (bytes.size() < 88 || bytes.size() > kMaxCompatibilityRecord) throw Error("invalid_access_cache", "Access descriptor size invalid");
+    size_t pos = 0, end = bytes.size() - 32; auto checksum = strongDigest(bytes.data(), end);
+    if (memcmp(checksum.data(), bytes.data() + end, 32)) throw Error("invalid_access_cache", "Access descriptor checksum invalid");
+    auto number = [&](unsigned width) {
+        if (pos > end || width > end - pos) throw Error("invalid_access_cache", "Truncated access descriptor");
+        uint64_t n = 0; for (unsigned i = 0; i < width; ++i) n |= uint64_t(bytes[pos++]) << (8 * i); return n;
+    };
+    if (number(8) != kAccessCacheMagic || number(4) != 1) throw Error("invalid_access_cache", "Access descriptor schema invalid");
+    if (pos > end || 32 > end - pos || memcmp(bytes.data() + pos, program.data(), 32))
+        throw Error("invalid_access_cache", "Access descriptor decoder changed");
+    pos += 32; uint64_t count = number(4);
+    if (!count || count > 1024) throw Error("invalid_access_cache", "Access descriptor inventory count invalid");
+    AccessHints out; std::string previous;
+    for (uint64_t i = 0; i < count; ++i) {
+        uint64_t length = number(4);
+        if (!length || length > 4096 || pos > end || length > end - pos) throw Error("invalid_access_cache", "Access descriptor path bound invalid");
+        std::string path(reinterpret_cast<const char*>(bytes.data() + pos), size_t(length)); pos += size_t(length);
+        uint32_t route = uint32_t(number(4));
+        if (path.front() != '/' || path.find('\0') != std::string::npos || path.ends_with(" (deleted)") ||
+            (!previous.empty() && path <= previous) || !validAccessRoute(route) || pos > end || 32 > end - pos)
+            throw Error("invalid_access_cache", "Access descriptor entry invalid");
+        AccessHint hint; hint.route = AccessRoute(route); memcpy(hint.digest.data(), bytes.data() + pos, 32); pos += 32;
+        out.emplace(path, hint); previous = std::move(path);
+    }
+    if (pos != end) throw Error("invalid_access_cache", "Access descriptor trailing data");
+    return out;
+}
+AccessHints& accessHints() {
+    static AccessHints hints;
+    static bool loaded = false;
+    static std::string state = "miss", detail;
+    if (!loaded) {
+        loaded = true;
+        try {
+            Fd directory(compatibilityDirectory());
+            Fd fd(openat(directory.value, "access.cache", O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW));
+            struct stat before{}, after{};
+            if (fd.value < 0 || fstat(fd.value, &before) || !privateMetadata(before, false) || before.st_size <= 0 ||
+                uint64_t(before.st_size) > kMaxCompatibilityRecord)
+                throw Error("invalid_access_cache", "Access descriptor absent or not root-private");
+            std::vector<uint8_t> bytes(size_t(before.st_size)); size_t done = 0;
+            while (done < bytes.size()) {
+                ssize_t n = pread(fd.value, bytes.data() + done, bytes.size() - done, off_t(done));
+                if (n <= 0) fail("access_cache_io", "Short access descriptor read"); done += size_t(n);
+            }
+            if (fstat(fd.value, &after) || !privateMetadata(after, false) || fileStamp(before) != fileStamp(after))
+                throw Error("invalid_access_cache", "Access descriptor changed while reading");
+            hints = decodeAccessHints(bytes, programDigest()); state = "persistent";
+        } catch (const Error& e) { detail = e.reason + ": " + e.what(); }
+          catch (const std::exception& e) { detail = e.what(); }
+    }
+    gMetrics.accessCache = hints.empty() ? state : (state == "persistent" ? "persistent" : "memory");
+    gMetrics.accessCacheDetail = detail;
+    return hints;
+}
+void saveAccessHints(const std::vector<ModuleFile>& inventory) {
+    try {
+        AccessHints next;
+        for (const auto& module : inventory) {
+            if (!module.readIdentity->digest) throw Error("invalid_access_cache", "Unverified ELF cannot enter access descriptor");
+            next.emplace(module.identity.path, AccessHint{module.route, *module.readIdentity->digest});
+        }
+        auto& previous = accessHints();
+        bool same = next.size() == previous.size();
+        for (const auto& [path, hint] : next) {
+            auto old = previous.find(path);
+            if (old == previous.end() || old->second.route != hint.route || old->second.digest != hint.digest) same = false;
+        }
+        if (same) return;
+        auto bytes = encodeAccessHints(next, programDigest());
+        Fd directory(compatibilityDirectory());
+        std::string temporary = "access.cache.tmp." + std::to_string(getpid()) + "." +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+        Fd fd(openat(directory.value, temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600));
+        if (fd.value < 0) fail("access_cache_io", "Cannot create private access descriptor");
+        try {
+            struct stat st{}; if (fstat(fd.value, &st) || !privateMetadata(st, false)) throw Error("invalid_access_cache", "Access descriptor metadata invalid");
+            size_t done = 0;
+            while (done < bytes.size()) { ssize_t n = write(fd.value, bytes.data() + done, bytes.size() - done); if (n <= 0) fail("access_cache_io", "Short access descriptor write"); done += size_t(n); }
+            if (fsync(fd.value) || renameat(directory.value, temporary.c_str(), directory.value, "access.cache") || fsync(directory.value))
+                fail("access_cache_io", "Cannot commit access descriptor");
+        } catch (...) { unlinkat(directory.value, temporary.c_str(), 0); throw; }
+        previous = std::move(next);
+        gMetrics.accessCache = "saved"; gMetrics.accessCacheDetail.clear();
+    } catch (const Error& e) { gMetrics.accessCacheDetail = e.reason + ": " + e.what(); }
+      catch (const std::exception& e) { gMetrics.accessCacheDetail = e.what(); }
 }
 const char* compatibilityName(Pipeline pipe) {return pipe==Pipeline::Recording?"recording.cache":"screenshot.cache";}
 CompatibilityRecord readCompatibility(Pipeline pipe) {
@@ -2368,7 +2633,7 @@ std::optional<Image> persistentImage(const std::vector<ModuleFile>& inventory,Pi
         std::vector<uint8_t> selected;uint64_t total=0;
         for(size_t i=0;i<canonical.size();++i) {
             auto bytes=readModule(canonical[i]);total+=bytes.size();
-            if(total>512*1024*1024 || strongDigest(bytes.data(),bytes.size())!=record.files[i].digest)return std::nullopt;
+            if(total>512*1024*1024 || *canonical[i].readIdentity->digest!=record.files[i].digest)return std::nullopt;
             if(i==record.selected)selected=std::move(bytes);
         }
         const auto& module=canonical[record.selected];
@@ -2409,7 +2674,8 @@ Image discoverImage(pid_t pid, uint64_t start, Pipeline pipe, ModuleFile* select
     auto& cache = caches[pipe];
     bool warm = cache.pid == pid && cache.start == start && cache.epoch == epoch && cache.inventory.size() == inventory.size();
     for (size_t i = 0; warm && i < inventory.size(); ++i)
-        warm = sameModule(cache.inventory[i].identity, inventory[i].identity) && cache.inventory[i].stamp == inventory[i].stamp;
+        warm = sameModule(cache.inventory[i].identity, inventory[i].identity) && cache.inventory[i].stamp == inventory[i].stamp &&
+            cache.inventory[i].route == inventory[i].route;
     if (warm) {
         gMetrics.discoveryCache = "memory";
         if (!cache.failureReason.empty()) throw Error(cache.failureReason, cache.failureDetail);
@@ -2435,6 +2701,7 @@ Image discoverImage(pid_t pid, uint64_t start, Pipeline pipe, ModuleFile* select
         for (const auto& module : inventory) unchanged = unchanged && currentStamp(module) == module.stamp;
         if (unchanged) {
             gMetrics.discoveryCache = "persistent";
+            saveAccessHints(inventory);
             cache.selectedPath = persisted->modulePath; cache.image = std::move(*persisted);
             if (selected) *selected = *std::find_if(inventory.begin(), inventory.end(), [&](const auto& m) { return m.identity.path == cache.selectedPath; });
             if (selectedEpoch) *selectedEpoch = epoch;
@@ -2451,7 +2718,7 @@ Image discoverImage(pid_t pid, uint64_t start, Pipeline pipe, ModuleFile* select
             if (total > 512 * 1024 * 1024) throw Error("unsupported_module_maps", "Mapped ELF discovery exceeds total read bound");
 #ifndef SF17FIX_INSPECT_ONLY
             if (pipe == Pipeline::Recording)
-                verifiedFiles.push_back({module.identity.path, module.stamp, strongDigest(bytes.data(), bytes.size())});
+                verifiedFiles.push_back({module.identity.path, module.stamp, *module.readIdentity->digest});
 #endif
             if (!hasSemanticAnchor(bytes, pipe)) continue;
             try {
@@ -2484,6 +2751,7 @@ Image discoverImage(pid_t pid, uint64_t start, Pipeline pipe, ModuleFile* select
         } catch (const std::exception&) { /* Cache persistence is optional; validated capability is not. */ }
 #endif
         cache.image = *found; cache.selectedPath = found->modulePath;
+        saveAccessHints(inventory);
         if (selected) *selected = *std::find_if(inventory.begin(), inventory.end(), [&](const auto& m) { return m.identity.path == found->modulePath; });
         if (selectedEpoch) *selectedEpoch = epoch;
         return *found;
@@ -2503,6 +2771,7 @@ struct Process {
     explicit Process(pid_t p, Pipeline pipe) : pid(p), start(processStart(p)), image(discoverImage(p, start, pipe, &module, &epoch)) {
         exe = processExe(pid); bias = image.moduleBias;
         moduleStamp = module.stamp;
+        gMetrics.selectedAccess = accessRouteName(module.route);
         if (module.identity.inode != image.moduleInode ||
             uint64_t(makedev(module.identity.major, module.identity.minor)) != image.moduleDevice)
             throw Error("module_identity_changed", "Selected file identity changed after discovery");
@@ -2913,6 +3182,12 @@ struct Result {
                 << ",\"original\":" << quote(hex(sites[i].original)) << ",\"replacement\":" << quote(hex(sites[i].replacement)) << '}';
         }
         output << "],\"errno\":" << error
+            << ",\"file_access\":{\"cache\":" << quote(metrics.accessCache)
+            << ",\"cache_detail\":" << quote(metrics.accessCacheDetail)
+            << ",\"selected_strategy\":" << quote(metrics.selectedAccess)
+            << ",\"attempts_truncated\":" << (metrics.accessDiagnosticsTruncated ? "true" : "false") << ",\"attempts\":[";
+        for (size_t i = 0; i < metrics.moduleAccess.size(); ++i) { if (i) output << ','; output << metrics.moduleAccess[i]; }
+        output << "]}"
             << ",\"performance\":{\"discovery_cache\":" << quote(metrics.discoveryCache)
             << ",\"discovery_ms\":" << metrics.discoveryMs << ",\"module_read_bytes\":" << metrics.moduleReadBytes
             << ",\"live_read_bytes\":" << metrics.liveReadBytes << ",\"ownership_prepare_ms\":" << metrics.ownershipPrepareMs

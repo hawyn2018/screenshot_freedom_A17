@@ -1,0 +1,33 @@
+自由截图A17 3.5.9
+包名net.hawyn.screenshotfreedoma17；versionCode 43；作者Hawyn; Codex。
+
+日志
+保留3.5.8_debug的手动运行/安装日志ZIP导出，版本名去掉_debug。
+主页状态卡新增“日志记录”开关，使用独立device-protected偏好，首次安装与从debug版升级默认关闭。
+关闭时不记录新增诊断日志、不收集安装故障快照、不执行日志导出Root收集器。
+关闭会清理应用私有诊断历史和导出临时文件，不删除Download归档、功能配置、ownership或兼容性缓存。
+开启后有界记录运行状态变化、异常和安装结果，失败先保留现场，用户手动导出。
+导出期间暂停日志开关操作，避免清理与导出冲突；处理日志开关在后台线程完成。
+命名：内部存储/Download/screenshotfreedom_log_3.5.9_yyyyMMdd_HHmmss.zip。
+日志资料的Root收集仅在手动导出时执行，保留只读范围、大小限制、文件清单与缺失原因。
+
+文件访问自身适配
+针对已收到日志中的module_identity_changed：/proc映射设备号与打开ELF的stat设备号不同。
+优先从可信procfs绑定的SurfaceFlinger进程目录获取exe或精确map_files句柄。
+可信映射句柄允许内核maps身份与文件stat身份分开校验；普通路径仍要求严格dev/inode一致。
+同时验证PID启动时间、映射epoch、文件前后stat、PT_LOAD关系、函数内容与补丁归属。
+自动在多个读取方式间选择，不增加品牌、机型或版本号限制，不跳过原代码匹配。
+成功读取方式与文件摘要缓存在/data/adb/enable_screenshot17fix/compat-cache/access.cache。
+缓存不保存PID、ASLR地址或VMA地址；复用时重新验证，文件或组件变化、访问失败时重新匹配。
+截图与录屏进程内匹配缓存及录屏持久证明缓存继续使用，热路径不重复扫描和哈希全部ELF。
+
+安装迁移
+旧helper恢复返回身份错误时，保留原始结果，由根目录临时新版helper重新校验并恢复。
+新版也必须确认inactive及无ownership遗留，才执行组件覆盖；不直接忽略旧错误或删除归属记录。
+系统模块同步更新为3.5.9/versionCode 43，原模块ID、路径和仲裁通信协议保持。
+
+保留与交付
+截图录屏Java hook、Binder入口鉴权、仲裁broker与协议、service.sh、真实SKIP测试图层和主题偏好保持。
+稳定3.5.6、存档3.5.7、诊断3.5.8_debug均保留。
+只进行离线编译、签名、包体及主机回归检查；未连接或操作设备，未推送安装，未自动发布GitHub。
+源码包排除签名私钥、口令、令牌、实际诊断日志包与系统采样文件。

@@ -1,4 +1,4 @@
-Screenshot Freedom A17 3.4.2 native companion
+Screenshot Freedom A17 3.5.9 native companion
 ======================================
 
 Build and artifact
@@ -27,6 +27,11 @@ the operation did not complete successfully. schema=1 fields:
   pid, build_id, site_offset, errno.
 3.2 also reports module_path, module_bias, module_device and module_inode for a
 live selected ELF. The inspect-only form has no live mapping identity.
+3.5.9 adds file_access with cache/cache_detail/selected_strategy and bounded
+attempts containing strategy, maps/file identities, stage and failure reasons.
+Attempts use access_reason/access_detail/access_errno so existing shell parsers
+keep reading the top-level result. They are limited to 128 entries and 12 KiB
+after JSON escaping; attempts_truncated reports omitted entries.
 3.0 adds pipeline="screenshot" or "recording", site_count, and a sites array
 (offset/function_start/function_end/original/replacement). Unknown commands return
 reason=usage and exit 20; unknown record-* commands retain pipeline="recording".
@@ -149,8 +154,17 @@ Two independently valid modules, duplicate loads, inaccessible mapped files or a
 incomplete anonymous/deleted executable inventory produce explicit diagnostics.
 There is no fallback to a guessed library or the first plausible match.
 
-The file is opened through /proc/PID/root and checked against the maps device and
-inode. The load bias is derived from executable PT_LOAD file/virtual addresses,
+The access selector first tries a cached, previously successful strategy, then
+the kernel's actual /proc/PID/exe, exact /proc/PID/map_files/LO-HI link, the
+process-root path and the absolute path. Magic-link following is confined to a
+verified procfs PID directory and these generated links, with matching logical
+paths, PID/start and full executable mapping epoch checked around discovery.
+An exact mapped-file FD can expose another stat device/inode on stacked mounts;
+its independent stat identity is checked before/after each bounded pread. The
+original maps identity remains the ownership identity. Ordinary path fallbacks
+still require strict maps/stat device+inode equality and final O_NOFOLLOW.
+
+The load bias is derived from executable PT_LOAD file/virtual addresses,
 with the actual page size; the entire enclosing function must lie in executable
 PT_LOAD and readable/executable mappings at the corresponding file offsets.
 The executable's resolved identity and process PID/start time are also checked.
@@ -162,6 +176,19 @@ cached identity, and revalidates PT_LOAD/mappings. Mapping or file metadata chan
 cause fresh discovery. A cold audit is bounded to 1024 executable modules and
 512 MiB of files; individual ELF size is limited to 64 MiB. Cached unsupported
 results retain the same identity invalidation rules.
+
+Successful access strategies are persisted in the root-private
+/data/adb/enable_screenshot17fix/compat-cache/access.cache. Schema, executable
+SHA-256, ordered logical paths, selected strategies, complete ELF digests and a
+record checksum are validated; no PID, VMA or ASLR address is serialized.
+This is a route hint, not a capability grant. Every reopening validates current
+process, mapping and file identity, and the ordinary decoder/live-code checks
+remain mandatory. Failed or stale routes are tried again through the selector.
+The expensive recording CFG proof cache is retained separately. Both pipelines
+keep their in-process discovery cache; a warm status operation never rehashes
+all ELF files. Candidate ELF FDs are closed promptly; only a proc PID directory
+FD is shared by each retained inventory. Cache persistence failures are optional
+diagnostics and do not waive any verification.
 
 Caching never bypasses the pre/post memory and stopped-process verification.
 Persistent ownership binds only the SELECTED module, so an unrelated later dlopen

@@ -1,15 +1,20 @@
 package net.hawyn.screenshotfreedoma17
 
+import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animate
@@ -82,11 +87,15 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import top.yukonga.miuix.kmp.basic.*
@@ -278,6 +287,59 @@ private fun ScreenshotApp(activity: MainActivity, controller: CompatController, 
         onDispose { activity.secureTest(false) }
     }
     val context = LocalContext.current
+    var loggingEnabled by remember { mutableStateOf(Diagnostics.isEnabled(context)) }
+    var loggingChanging by remember { mutableStateOf(false) }
+    var logExportBusy by remember { mutableStateOf(false) }
+    var logExportMessage by rememberSaveable { mutableStateOf("") }
+    val changeLogging: (Boolean) -> Unit = { enabled ->
+        if (!loggingChanging && !logExportBusy) scope.launch {
+            loggingChanging = true
+            try {
+                withContext(Dispatchers.IO) { Diagnostics.setEnabled(context.applicationContext, enabled) }
+                logExportMessage = if (enabled) "日志已开启，请复现问题后导出" else ""
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                logExportMessage = "日志设置失败：${error.message ?: error.javaClass.simpleName}"
+            } finally {
+                loggingEnabled = Diagnostics.isEnabled(context)
+                loggingChanging = false
+            }
+        }
+    }
+    val exportLogs: () -> Unit = {
+        if (loggingEnabled && !loggingChanging && !logExportBusy) scope.launch {
+            logExportBusy = true
+            logExportMessage = "正在收集运行与安装日志，请留意 Root 授权提示…"
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    Diagnostics.export(context.applicationContext, controller.diagnosticsSnapshot())
+                }
+                logExportMessage = "已保存到 Download/${result.fileName}" +
+                    if (result.warning.isNullOrBlank()) "" else "\n${result.warning}"
+                Toast.makeText(context, "日志已导出到 Download", Toast.LENGTH_LONG).show()
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                Diagnostics.recordError(context, "export_failed", error)
+                logExportMessage = "导出失败：${error.message ?: error.javaClass.simpleName}"
+                Toast.makeText(context, logExportMessage, Toast.LENGTH_LONG).show()
+            } finally {
+                logExportBusy = false
+            }
+        }
+    }
+    val logStoragePermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) exportLogs() else {
+            logExportMessage = "需要存储权限才能将日志保存到 Download"
+            Diagnostics.record(context, "export_permission_denied", "Legacy public Download storage permission was denied")
+        }
+    }
+    val requestLogExport: () -> Unit = {
+        if (loggingEnabled && !loggingChanging && !logExportBusy) {
+            if (Build.VERSION.SDK_INT <= 28 && ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+                logStoragePermission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            } else exportLogs()
+        }
+    }
     val configuration = LocalConfiguration.current
     val systemAccent = remember(configuration) {
         val id = context.resources.getIdentifier("system_accent1_500", "color", "android")
@@ -334,7 +396,9 @@ private fun ScreenshotApp(activity: MainActivity, controller: CompatController, 
                                 1 -> SecurePage(insets, secureScroll, headers[1], secureRequest, { secureRequest = it })
                                 2 -> SkipPage(insets, skipScroll, headers[2], status)
                                 3 -> ThemePage(insets, themeScroll, headers[3], appearance, updateAppearance, accent)
-                                else -> HomePage(insets, homeScroll, headers[0], status, controller) {
+                                else -> HomePage(insets, homeScroll, headers[0], status, controller,
+                                    loggingEnabled, loggingChanging, changeLogging,
+                                    logExportBusy, logExportMessage, requestLogExport) {
                                     status = controller.runtimeStatus()
                                 }
                             }
@@ -650,7 +714,9 @@ private fun PageHeading(header: PageHeaderState, eyebrow: String, subtitle: Stri
 }
 
 @Composable
-private fun HomePage(insets: PaddingValues, scroll: LazyListState, header: PageHeaderState, status: RuntimeStatus, controller: CompatController, settingsChanged: () -> Unit) {
+private fun HomePage(insets: PaddingValues, scroll: LazyListState, header: PageHeaderState, status: RuntimeStatus, controller: CompatController,
+                     loggingEnabled: Boolean, loggingChanging: Boolean, changeLogging: (Boolean) -> Unit,
+                     logExportBusy: Boolean, logExportMessage: String, exportLogs: () -> Unit, settingsChanged: () -> Unit) {
     val context = LocalContext.current
     var showCaptureTools by remember { mutableStateOf(false) }
     if (showCaptureTools) CaptureToolPicker(controller.getCaptureToolPackages(),
@@ -730,6 +796,18 @@ private fun HomePage(insets: PaddingValues, scroll: LazyListState, header: PageH
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     Button(onClick = { controller.retryModuleUpgradeAsync(); controller.refreshAsync() }, modifier = Modifier.weight(1f), insideMargin = PaddingValues(horizontal = 10.dp, vertical = 12.dp)) { Text("刷新状态", fontSize = 13.sp) }
                     Button(onClick = { controller.installNativeAsync() }, modifier = Modifier.weight(1.45f), insideMargin = PaddingValues(horizontal = 10.dp, vertical = 12.dp)) { Text("安装/更新系统模块", fontSize = 13.sp) }
+                }
+                Spacer(Modifier.height(10.dp))
+                ToggleRow("日志记录", "出现问题时开启，复现后导出日志", loggingEnabled, changeLogging,
+                    enabled = !loggingChanging && !logExportBusy,
+                    contentPadding = PaddingValues(vertical = 10.dp))
+                Button(onClick = exportLogs, enabled = loggingEnabled && !loggingChanging && !logExportBusy, modifier = Modifier.fillMaxWidth(),
+                    insideMargin = PaddingValues(horizontal = 10.dp, vertical = 12.dp)) {
+                    Text(if (logExportBusy) "正在导出日志…" else "导出日志", fontSize = 13.sp)
+                }
+                if (logExportMessage.isNotBlank()) {
+                    Spacer(Modifier.height(10.dp))
+                    Caption(logExportMessage)
                 }
             }
         }
