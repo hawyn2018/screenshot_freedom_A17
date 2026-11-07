@@ -1,8 +1,4 @@
-<p align="center">
-  <a href="#qq-group">QQ 交流群 941336897</a> ·
-  <a href="https://t.me/blroot">Telegram @blroot</a>
-</p>
-<p align="center"><img src="docs/app-icon.svg" width="104" height="104" alt="自由截图 A17 应用图标"></p>
+<p align="center"><img src="docs/app-icon.svg" width="180" height="180" alt="自由截图 A17 应用图标"></p>
 <h1 align="center">自由截图 A17 · Screenshot Freedom A17</h1>
 <p align="center">
   <a href="#qq-group">QQ 群 941336897</a> ·
