@@ -2,6 +2,7 @@
 package net.hawyn.screenshotfreedoma17
 
 import android.content.Context
+import android.os.Build
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -9,7 +10,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.paneTitle
@@ -47,8 +47,9 @@ internal fun LicenseConsentPrompt(saving: Boolean, error: Boolean, readFull: () 
                                    agree: () -> Unit, exit: () -> Unit, modifier: Modifier,
                                    footer: @Composable () -> Unit) {
     val maxHeight = LocalConfiguration.current.screenHeightDp.dp * .86f
+    val frostedTint = MiuixTheme.colorScheme.surface.copy(alpha = if (Build.VERSION.SDK_INT >= 31) .30f else .88f)
     // Share the activity window so predictive Back can reveal this prompt before committing.
-    Box(modifier.background(Color.Black.copy(alpha = .32f)).safeDrawingPadding(),
+    Box(modifier.background(frostedTint).safeDrawingPadding(),
         contentAlignment = Alignment.Center) {
         Card(modifier = Modifier.padding(horizontal = 18.dp).widthIn(max = 520.dp).fillMaxWidth()
             .semantics { paneTitle = "开源许可证" },

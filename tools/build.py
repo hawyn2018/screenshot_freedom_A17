@@ -10,8 +10,8 @@ import sys
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '3.6.7'
-VERSION_CODE = 51
+VERSION = '3.6.9'
+VERSION_CODE = 53
 # Capture compatibility uses the independently controlled native companion.
 ROOT_COMPONENT_VERSION = '3.6.1'
 UI_BASELINE_VERSION = '3.5.6'
@@ -76,7 +76,7 @@ def package_root_component():
 def verify_compatibility_update_scope():
     """Verify the app update keeps native and framework capture code intact."""
     import json
-    baseline_version = '3.6.6'
+    baseline_version = '3.6.8'
     baseline = ROOT / 'releases' / baseline_version
     source = baseline / f'{ARTIFACT_NAME}-{baseline_version}-source.zip'
     record_path = baseline / 'release-record.json'
@@ -87,7 +87,7 @@ def verify_compatibility_update_scope():
     if hashlib.sha256(source.read_bytes()).hexdigest() != record['artifacts'][source.name]:
         raise RuntimeError('Compatibility baseline source differs from its sealed release')
     ui = 'app/src/main/java/net/hawyn/screenshotfreedoma17/'
-    allowed = {ui + 'MainActivity.kt', ui + 'LicenseContent.kt'}
+    allowed = {ui + 'MainActivity.kt'}
     def functional(name):
         return (name.startswith('app/src/') or
                 (name.startswith('native/') and 'build' not in Path(name).parts) or
@@ -115,7 +115,7 @@ def verify_compatibility_update_scope():
               'baseline_version': baseline_version, 'allowed_functional_files': changed,
               'byte_identical_functional_files': protected,
               'device_validation': False,
-              'scope': 'Share the home footer across all full pages. '
+              'scope': 'Fade out the first-launch prompt or full license after successful consent. '
                        'License content and system capture code are preserved.'}
     tag = 'v' + VERSION.replace('.', '')
     target = ROOT / 'verification' / f'{tag}-compatibility-scope-verification.json'

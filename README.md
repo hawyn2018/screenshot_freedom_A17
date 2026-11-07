@@ -8,7 +8,7 @@
 </p>
 <p align="center">
   <a href="#zh-cn">中文版</a> · <a href="#en">English</a> ·
-  <a href="https://github.com/hawyn2018/screenshot_freedom_A17/releases/tag/v3.6.7">v3.6.7 源码 / Source</a>
+  <a href="https://github.com/hawyn2018/screenshot_freedom_A17/releases/tag/v3.6.9">v3.6.9 源码 / Source</a>
 </p>
 
 <a name="zh-cn"></a>
@@ -21,7 +21,7 @@
 
 1. 按[构建说明](#build)生成并安装自己的签名 APK。首次打开时，可阅读完整许可证，再确认或退出。
 2. **窗口保护**：在兼容 libxposed API 102 的 LSPosed 框架中启用「自由截图 A17」，勾选推荐的「系统框架」作用域，然后按框架提示重启。若系统厂商在独立截图或录屏进程中额外检查结果或显示提示，可按设备实际情况加入对应的**系统采集组件**，再重新加载。保持被采集的普通应用在作用域之外。
-3. **图层排除与采集仲裁**：在有 Root 的设备上，点击首页「安装/更新系统模块」，或通过 KernelSU 安装构建生成的系统模块 ZIP。按管理器提示重启，回到首页确认截图子层、录屏子层和采集仲裁状态。应用版本为 **3.6.7**，配套系统模块版本为 **3.6.1**。
+3. **图层排除与采集仲裁**：在有 Root 的设备上，点击首页「安装/更新系统模块」，或通过 KernelSU 安装构建生成的系统模块 ZIP。按管理器提示重启，回到首页确认截图子层、录屏子层和采集仲裁状态。应用版本为 **3.6.9**，配套系统模块版本为 **3.6.1**。
 4. 在首页按需打开下表中的开关。分别在「窗口测试」和「图层测试」使用系统截图或录屏，检查保存文件中的四色、字母和图案编号。改变录屏配置后，请停止旧录屏再开始。ADB 投屏也可断开重连后对照测试。
 
 | 首页开关 | 作用 |
@@ -48,7 +48,7 @@ Screenshot Freedom A17 was built to lift Android 17 screenshot restrictions. It 
 
 1. Follow the [build instructions](#build) to generate and install an APK signed with your own key. On first launch, you can read the full license before accepting or exiting.
 2. **Window protection:** Enable Screenshot Freedom A17 in an LSPosed framework compatible with libxposed API 102, select the recommended **System Framework** scope, and restart as prompted. If an OEM checks results or displays warnings in a separate screenshot or recording process, add the corresponding **system capture component** to the scope as needed and reload. Keep ordinary apps being captured outside the scope.
-3. **Layer exclusion and capture-tool rules:** On a rooted device, choose **Install / update system module** on the home page, or install the system module ZIP produced by the build through KernelSU. Restart as instructed by the manager, then check the screenshot layer, recording layer, and capture-tool arbitration statuses on the home page. The app version is **3.6.7** and the companion module version is **3.6.1**.
+3. **Layer exclusion and capture-tool rules:** On a rooted device, choose **Install / update system module** on the home page, or install the system module ZIP produced by the build through KernelSU. Restart as instructed by the manager, then check the screenshot layer, recording layer, and capture-tool arbitration statuses on the home page. The app version is **3.6.9** and the companion module version is **3.6.1**.
 4. Enable the switches below as needed. Use your system screenshot or recording controls on the **Window Test** and **Layer Test** pages, then check the saved file for all four colors, the letters, and the pattern number. Restart recording after changing its settings. Reconnect ADB mirroring when comparing results.
 
 | Home switch | What it does |

@@ -14,8 +14,8 @@ android {
         applicationId = "net.hawyn.screenshotfreedoma17"
         minSdk = 26
         targetSdk = 37
-        versionCode = 51
-        versionName = "3.6.7"
+        versionCode = 53
+        versionName = "3.6.9"
     }
 
     buildFeatures {

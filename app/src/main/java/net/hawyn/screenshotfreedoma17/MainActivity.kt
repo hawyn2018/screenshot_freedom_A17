@@ -28,6 +28,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.rememberScrollState
@@ -52,12 +53,15 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.BlurEffect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.TileMode
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.luminance
@@ -76,6 +80,7 @@ import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.hideFromAccessibility
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.LinkAnnotation
@@ -273,8 +278,18 @@ private fun ScreenshotApp(activity: MainActivity, controller: CompatController, 
     val context = LocalContext.current
     val consent = remember(context) { LicenseConsent(context) }
     var licenseAccepted by remember(consent) { mutableStateOf(consent.accepted()) }
+    var prepareAppUi by remember { mutableStateOf(licenseAccepted) }
+    LaunchedEffect(Unit) {
+        if (!prepareAppUi) {
+            // Let the first frame show the prompt before laying out the page underneath.
+            withFrameNanos { }
+            prepareAppUi = true
+        }
+    }
     var consentSaving by remember { mutableStateOf(false) }
     var consentError by remember { mutableStateOf(false) }
+    var consentOpacity by remember { mutableFloatStateOf(1f) }
+    var fadeFromLicense by remember { mutableStateOf(false) }
     val navigate: (Int) -> Unit = { page ->
         keyboard?.hide()
         navigationJob?.cancel()
@@ -325,8 +340,17 @@ private fun ScreenshotApp(activity: MainActivity, controller: CompatController, 
             try {
                 val saved = withContext(Dispatchers.IO) { consent.accept() }
                 if (saved) {
-                    licenseAccepted = true
-                    closeInfo()
+                    fadeFromLicense = displayedInfoPage != null
+                    infoAnimation?.cancel()
+                    infoPage = null
+                    try {
+                        animate(1f, 0f, animationSpec = tween(220, easing = FastOutSlowInEasing)) { value, _ ->
+                            consentOpacity = value
+                        }
+                    } finally {
+                        displayedInfoPage = null
+                        licenseAccepted = true
+                    }
                 } else consentError = true
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
@@ -507,13 +531,20 @@ private fun ScreenshotApp(activity: MainActivity, controller: CompatController, 
         val updateAppearance: (Appearance) -> Unit = { appearance = it; preferences.write(it) }
         val blurRadius = backgroundBlurRadius(appearance.topBlurStrength)
         Box(Modifier.fillMaxSize().clipToBounds().background(MiuixTheme.colorScheme.surface)) {
-            if (licenseAccepted) {
-                val backgroundPage = if (displayedInfoPage != null) Modifier.clearAndSetSemantics {} else Modifier
+            if (prepareAppUi || licenseAccepted) {
+                val blocked = !licenseAccepted || displayedInfoPage != null
+                val backgroundPage = if (blocked) Modifier.clearAndSetSemantics { hideFromAccessibility() }
+                    .focusProperties { onEnter = { cancelFocusChange() } }.focusGroup() else Modifier
                 Scaffold(
                     modifier = backgroundPage.drawWithContent {
                         // Keep the pager ready to reveal without drawing it under an opaque page.
-                        if (displayedInfoPage == null || infoOffset > 0f) drawContent()
-                    },
+                        if (displayedInfoPage == null || infoOffset > 0f || (!licenseAccepted && consentOpacity < 1f))
+                            drawContent()
+                    }.then(if (licenseAccepted) Modifier else Modifier.graphicsLayer {
+                        val radius = 24.dp.toPx() * consentOpacity
+                        renderEffect = if (radius > .5f) BlurEffect(radius, radius, TileMode.Clamp) else null
+                        clip = true
+                    }),
                     containerColor = MiuixTheme.colorScheme.surface,
                     bottomBar = {
                         Box(Modifier.imePadding()) { AppNavigation(selected, pagePosition, navigate, appearance, backdrop, dark) }
@@ -526,14 +557,14 @@ private fun ScreenshotApp(activity: MainActivity, controller: CompatController, 
                             .background(MiuixTheme.colorScheme.surface)) {
                             HorizontalPager(
                                 state = pager,
-                                beyondViewportPageCount = 1,
+                                beyondViewportPageCount = if (licenseAccepted) 1 else 0,
                                 key = { it },
                                 modifier = Modifier.fillMaxSize().clipToBounds(),
                             ) { tab ->
                                 Box(Modifier.fillMaxSize().clipToBounds()) {
                                     when (tab) {
                                         1 -> SecurePage(insets, secureScroll, headers[1], secureRequest, { secureRequest = it })
-                                        2 -> SkipPage(insets, skipScroll, headers[2], status)
+                                        2 -> if (licenseAccepted) SkipPage(insets, skipScroll, headers[2], status) else Unit
                                         3 -> ThemePage(insets, themeScroll, headers[3], appearance, updateAppearance, accent)
                                         else -> HomePage(insets, homeScroll, headers[0], status, controller,
                                             loggingEnabled, loggingChanging, changeLogging,
@@ -550,27 +581,29 @@ private fun ScreenshotApp(activity: MainActivity, controller: CompatController, 
                 }
             }
             if (!licenseAccepted) {
-                val promptCovered = if (displayedInfoPage != null) Modifier.clearAndSetSemantics {} else Modifier
-                LicenseConsentPrompt(consentSaving, consentError, readFull = { openInfo(InfoPage.LICENSE) },
-                    agree = { if (displayedInfoPage == null) acceptLicense() },
-                    exit = { if (displayedInfoPage == null) activity.finish() },
-                    modifier = Modifier.matchParentSize().then(promptCovered).drawWithContent {
-                        if (displayedInfoPage == null || infoOffset > 0f) drawContent()
-                    }) {
-                    Footer(compact = true)
+                Box(Modifier.matchParentSize().blockPageTouches())
+                if (!fadeFromLicense) {
+                    val promptCovered = if (displayedInfoPage != null) Modifier.clearAndSetSemantics {} else Modifier
+                    LicenseConsentPrompt(consentSaving, consentError, readFull = { openInfo(InfoPage.LICENSE) },
+                        agree = { if (displayedInfoPage == null) acceptLicense() },
+                        exit = { if (displayedInfoPage == null) activity.finish() },
+                        modifier = Modifier.matchParentSize().then(promptCovered).drawWithContent {
+                            if (displayedInfoPage == null || infoOffset > 0f) drawContent()
+                        }.graphicsLayer { alpha = consentOpacity }) {
+                        Footer(compact = true)
+                    }
                 }
             }
             displayedInfoPage?.let { page ->
                 // The revealed strip of the previous page is a preview until Back completes.
-                Box(Modifier.matchParentSize().pointerInput(Unit) {
-                    awaitPointerEventScope {
-                        while (true) awaitPointerEvent().changes.forEach { it.consume() }
-                    }
-                })
+                Box(Modifier.matchParentSize().blockPageTouches())
                 val infoBackdrop = if (backdrop != null) rememberLayerBackdrop() else null
                 val offerConsent = remember(page) { !licenseAccepted }
                 Scaffold(
-                    modifier = Modifier.fillMaxSize().graphicsLayer { translationX = size.width * infoOffset },
+                    modifier = Modifier.fillMaxSize().graphicsLayer {
+                        translationX = size.width * infoOffset
+                        alpha = if (fadeFromLicense && !licenseAccepted) consentOpacity else 1f
+                    },
                     containerColor = MiuixTheme.colorScheme.surface,
                 ) { insets ->
                     InfoPageContent(page, insets, infoBackdrop, blurRadius,
@@ -579,6 +612,12 @@ private fun ScreenshotApp(activity: MainActivity, controller: CompatController, 
                 }
             }
         }
+    }
+}
+
+private fun Modifier.blockPageTouches(): Modifier = pointerInput(Unit) {
+    awaitPointerEventScope {
+        while (true) awaitPointerEvent().changes.forEach { it.consume() }
     }
 }
 
