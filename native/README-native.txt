@@ -1,5 +1,15 @@
-Screenshot Freedom A17 3.5.9 native companion
+Screenshot Freedom A17 3.6.1 native companion
 ======================================
+
+Health scheduling
+-----------------
+Both modes read the app-owned sf17fix-health-interval.conf alongside the
+existing desired-state files. The value is a decimal integer from 0 to 86400
+seconds, with 60 as the missing/invalid default. Zero removes the periodic full
+engine check. Configuration/lifecycle events, explicit refresh requests, target
+exit notifications when supported, and capture-command verification still run.
+The status TTL is bounded separately from scheduling; an old snapshot does not
+prove the broker is still running. The app can request a fresh check explicitly.
 
 Build and artifact
 ------------------

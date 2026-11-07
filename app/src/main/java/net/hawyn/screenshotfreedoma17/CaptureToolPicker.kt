@@ -185,11 +185,13 @@ internal fun CaptureToolPicker(initial: Set<String>, initialFlagSecure: Set<Stri
 private fun loadCaptureTools(context: Context, retained: Set<String>): List<CaptureToolEntry> {
     val manager = context.packageManager
     val entries = manager.getInstalledApplications(0).asSequence().map { app ->
-            val label = runCatching { app.loadLabel(manager).toString() }.getOrDefault(app.packageName)
+            val label = if (app.uid == AdbMirrorProfile.SHELL_UID) "ADB 投屏（系统 Shell）"
+                else runCatching { app.loadLabel(manager).toString() }.getOrDefault(app.packageName)
             val icon = runCatching { app.loadIcon(manager).toBitmap(84, 84).asImageBitmap() }.getOrNull()
             CaptureToolEntry(app.packageName, label, icon,
                 app.flags and (ApplicationInfo.FLAG_SYSTEM or ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0)
         }.toMutableList()
+    entries += CaptureToolEntry(AdbMirrorProfile.ROOT_TOOL_KEY, "ADB 投屏（Root 镜像）", null, true)
     val installed = entries.mapTo(HashSet()) { it.packageName }
     retained.filterNot { it in installed }.forEach { entries += CaptureToolEntry(it, "已保存的工具", null, false) }
     val collator = Collator.getInstance(Locale.getDefault())

@@ -3,7 +3,9 @@ Authors: Hawyn; Codex
 
 Screenshot compatibility methods are informed by the GPL-3.0 projects
 LSPosed/DisableFlagSecure and LuckyTool and the local device framework audit.
-This module is distributed with complete source under GPL-3.0.
+Starting with 3.6.2, the project's own code is distributed with complete source
+under AGPL-3.0-only. Existing third-party code and notices retain their own
+licenses. For GPL-3.0 text, see LICENSES/GPL-3.0.txt in the source package.
 https://github.com/LSPosed/DisableFlagSecure
 https://github.com/luckyzyx/LuckyTool
 
@@ -29,5 +31,11 @@ https://github.com/LSPosed/AndroidHiddenApiBypass
 Root companion semantics are based on Android Open Source Project
 SurfaceFlinger, ScreenCaptureOutput and LayerFilter source (Apache License 2.0):
 https://android.googlesource.com/platform/frameworks/native/
-The companion is independently implemented and distributed under GPL-3.0.
+The companion is independently implemented. Earlier release archives retain
+their original license notices.
 No original system binary is distributed or modified on disk.
+
+Support-page text and QR images were supplied in hnubl-3.0.9-ui-content.zip.
+The AGPLv3 Chinese text in the app is an unofficial AI translation from that
+package; the official English text is authoritative.
+https://www.gnu.org/licenses/agpl-3.0.html

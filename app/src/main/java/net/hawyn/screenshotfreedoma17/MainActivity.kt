@@ -1,16 +1,21 @@
 package net.hawyn.screenshotfreedoma17
 
 import android.Manifest
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.PredictiveBackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -22,6 +27,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.rememberScrollState
@@ -45,6 +51,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Color
@@ -57,6 +64,7 @@ import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.path
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -68,6 +76,7 @@ import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
@@ -94,6 +103,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
@@ -154,6 +165,7 @@ class MainActivity : ComponentActivity() {
 }
 
 private const val ARBITRATION_DISABLED_LABEL = "系统采集仲裁已关闭，将允许所有采集工具"
+private enum class InfoPage(val title: String) { SUPPORT("支持"), LICENSE("许可证") }
 
 private data class RuntimeStatus(
     val secure: Boolean = true,
@@ -171,6 +183,8 @@ private data class RuntimeStatus(
     val native: Boolean = false,
     val nativeMatching: Boolean = false,
     val nativeKnown: Boolean = false,
+    val nativeHealthSnapshotStale: Boolean = false,
+    val nativeHealthRefreshPending: Boolean = false,
     val nativeOperationOk: Boolean = false,
     val nativeCapabilityGap: Boolean = false,
     val recordingNative: Boolean = false,
@@ -202,6 +216,8 @@ private fun CompatController.runtimeStatus() = RuntimeStatus(
     captureToolMigrationNotice = getCaptureToolMigrationNotice(),
     framework = isFrameworkConnected(), frameworkLoaded = isFrameworkLoaded(),
     configurationSynced = isConfigurationSynced(), native = isNativeActive(), nativeKnown = isNativeKnown(),
+    nativeHealthSnapshotStale = isNativeHealthSnapshotStale(),
+    nativeHealthRefreshPending = isAwaitingNativeHealthRefresh(),
     nativeMatching = isNativeMatching(),
     nativeOperationOk = isNativeOperationOk(),
     nativeCapabilityGap = hasNativeCapabilityGap(),
@@ -254,6 +270,11 @@ private fun ScreenshotApp(activity: MainActivity, controller: CompatController, 
     val scope = rememberCoroutineScope()
     var navigationJob by remember { mutableStateOf<Job?>(null) }
     val keyboard = LocalSoftwareKeyboardController.current
+    val context = LocalContext.current
+    val consent = remember(context) { LicenseConsent(context) }
+    var licenseAccepted by remember(consent) { mutableStateOf(consent.accepted()) }
+    var consentSaving by remember { mutableStateOf(false) }
+    var consentError by remember { mutableStateOf(false) }
     val navigate: (Int) -> Unit = { page ->
         keyboard?.hide()
         navigationJob?.cancel()
@@ -265,28 +286,137 @@ private fun ScreenshotApp(activity: MainActivity, controller: CompatController, 
     }
     var status by remember { mutableStateOf(controller.runtimeStatus()) }
     var secureRequest by rememberSaveable { mutableStateOf(true) }
-    LaunchedEffect(initialTab, navigationSerial) { if (navigationSerial > 0) navigate(initialTab) }
+    var infoPage by rememberSaveable { mutableStateOf<InfoPage?>(null) }
+    var displayedInfoPage by remember { mutableStateOf(infoPage) }
+    var infoOffset by remember { mutableFloatStateOf(0f) }
+    var infoAnimation by remember { mutableStateOf<Job?>(null) }
+    val animateInfo: (Float) -> Unit = { target ->
+        infoAnimation?.cancel()
+        infoAnimation = scope.launch {
+            if (target != infoOffset) {
+                val duration = (abs(target - infoOffset) * 280).roundToInt().coerceAtLeast(110)
+                animate(infoOffset, target, animationSpec = tween(duration, easing = FastOutSlowInEasing)) { value, _ ->
+                    infoOffset = value
+                }
+            }
+            if (target == 1f) displayedInfoPage = null
+        }
+    }
+    val openInfo: (InfoPage) -> Unit = { page ->
+        if (displayedInfoPage == null) {
+            keyboard?.hide()
+            navigationJob?.cancel()
+            infoOffset = 1f
+            infoPage = page
+            displayedInfoPage = page
+            animateInfo(0f)
+        }
+    }
+    val closeInfo: () -> Unit = {
+        if (infoPage != null) {
+            infoPage = null
+            animateInfo(1f)
+        }
+    }
+    val acceptLicense: () -> Unit = {
+        if (!consentSaving && !licenseAccepted) scope.launch {
+            consentSaving = true
+            consentError = false
+            try {
+                val saved = withContext(Dispatchers.IO) { consent.accept() }
+                if (saved) {
+                    licenseAccepted = true
+                    closeInfo()
+                } else consentError = true
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                consentError = true
+            } finally {
+                consentSaving = false
+            }
+            if (consentError && infoPage != null)
+                Toast.makeText(context, "同意状态保存失败，请重试。", Toast.LENGTH_SHORT).show()
+        }
+    }
+    LaunchedEffect(initialTab, navigationSerial) {
+        if (navigationSerial > 0) {
+            infoAnimation?.cancel()
+            infoPage = null
+            displayedInfoPage = null
+            navigate(initialTab)
+        }
+    }
     LaunchedEffect(selected) { if (selected != 3) keyboard?.hide() }
     val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
-    BackHandler((selected != 0 || pager.isScrollInProgress) && !imeVisible) { navigate(0) }
-    LaunchedEffect(activity, controller) {
-        activity.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            while (true) {
-                controller.pollStatusAsync()
-                status = controller.runtimeStatus()
-                val matching = status.nativeMatching || status.recordingNativeMatching || status.policyMatching
-                val waiting = !status.configurationSynced || !status.frameworkLoaded || !status.nativeKnown ||
-                    !status.recordingNativeKnown || (status.policyRunning && !status.policyReady)
-                delay(if (matching) 1000 else if (waiting) 2000 else 5000)
+    BackHandler(licenseAccepted && displayedInfoPage == null && (selected != 0 || pager.isScrollInProgress) && !imeVisible) { navigate(0) }
+    BackHandler(!licenseAccepted && displayedInfoPage == null) { /* Use the consent prompt's Exit button. */ }
+    PredictiveBackHandler(enabled = displayedInfoPage != null) { events ->
+        val page = infoPage
+        var startOffset: Float? = null
+        try {
+            events.collect { event ->
+                if (page != null && page == infoPage && !consentSaving) {
+                    val start = startOffset ?: infoOffset.also {
+                        infoAnimation?.cancel()
+                        startOffset = it
+                    }
+                    infoOffset = start + (1f - start) * event.progress.coerceIn(0f, 1f)
+                }
+            }
+            if (page == infoPage) {
+                if (!consentSaving) closeInfo()
+                else if (startOffset != null) animateInfo(0f)
+            }
+        } catch (cancelled: CancellationException) {
+            if (startOffset != null && page == infoPage) animateInfo(0f)
+            throw cancelled
+        }
+    }
+    LaunchedEffect(activity, controller, licenseAccepted) {
+        if (!licenseAccepted) return@LaunchedEffect
+        activity.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            val power = activity.getSystemService(PowerManager::class.java)
+            val interactive = MutableStateFlow(true)
+            val screen = object : BroadcastReceiver() {
+                override fun onReceive(context: Context, intent: Intent) {
+                    interactive.value = intent.action == Intent.ACTION_SCREEN_ON
+                }
+            }
+            val filter = IntentFilter(Intent.ACTION_SCREEN_ON).apply { addAction(Intent.ACTION_SCREEN_OFF) }
+            ContextCompat.registerReceiver(activity, screen, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+            try {
+                interactive.value = power?.isInteractive != false
+                interactive.collectLatest { visible ->
+                    if (!visible) return@collectLatest
+                    controller.pollStatusAsync()
+                    while (true) {
+                        if (pager.currentPage == 0 && displayedInfoPage == null)
+                            controller.refreshStaleNativeHealthAsync()
+                        status = controller.runtimeStatus()
+                        val matching = status.nativeMatching || status.recordingNativeMatching || status.policyMatching
+                        val refreshing = status.nativeHealthSnapshotStale && status.nativeHealthRefreshPending
+                        val waiting = !status.configurationSynced || !status.frameworkLoaded ||
+                            (!status.nativeHealthSnapshotStale && (!status.nativeKnown || !status.recordingNativeKnown ||
+                                (status.policyRunning && !status.policyReady)))
+                        delay(if (matching || refreshing) 1000 else if (waiting) 2000 else 5000)
+                        if (power?.isInteractive == false) {
+                            // Fallback if a vendor omits the SCREEN_OFF broadcast.
+                            interactive.value = false
+                            break
+                        }
+                        controller.pollStatusAsync()
+                    }
+                }
+            } finally {
+                activity.unregisterReceiver(screen)
             }
         }
     }
-    val secureActive = fullySettled && selected == 1 && secureRequest
+    val secureActive = licenseAccepted && displayedInfoPage == null && fullySettled && selected == 1 && secureRequest
     DisposableEffect(secureActive) {
         activity.secureTest(secureActive)
         onDispose { activity.secureTest(false) }
     }
-    val context = LocalContext.current
     var loggingEnabled by remember { mutableStateOf(Diagnostics.isEnabled(context)) }
     var loggingChanging by remember { mutableStateOf(false) }
     var logExportBusy by remember { mutableStateOf(false) }
@@ -351,8 +481,8 @@ private fun ScreenshotApp(activity: MainActivity, controller: CompatController, 
         "dark" -> if (appearance.monet) ColorSchemeMode.MonetDark else ColorSchemeMode.Dark
         else -> if (appearance.monet) ColorSchemeMode.MonetSystem else ColorSchemeMode.System
     }
-    val palette = runCatching { ThemePaletteStyle.valueOf(appearance.palette) }.getOrDefault(ThemePaletteStyle.TonalSpot)
-    val colorSpec = runCatching { ThemeColorSpec.valueOf(appearance.colorSpec) }.getOrDefault(ThemeColorSpec.Spec2025)
+    val palette = runCatching { ThemePaletteStyle.valueOf(appearance.palette) }.getOrDefault(ThemePaletteStyle.Vibrant)
+    val colorSpec = runCatching { ThemeColorSpec.valueOf(appearance.colorSpec) }.getOrDefault(ThemeColorSpec.Spec2021)
     val theme = remember(mode, accent, palette, colorSpec) {
         ThemeController(
             colorSchemeMode = mode,
@@ -375,38 +505,78 @@ private fun ScreenshotApp(activity: MainActivity, controller: CompatController, 
     MiuixTheme(controller = theme) {
         val backdrop = if (isRuntimeShaderSupported()) rememberLayerBackdrop() else null
         val updateAppearance: (Appearance) -> Unit = { appearance = it; preferences.write(it) }
-        Scaffold(
-            containerColor = MiuixTheme.colorScheme.surface,
-            bottomBar = { Box(Modifier.imePadding()) { AppNavigation(selected, pagePosition, navigate, appearance, backdrop, dark) } },
-        ) { insets ->
-            val safeTop = pageTopInset(insets)
-            Box(Modifier.fillMaxSize().background(MiuixTheme.colorScheme.surface)) {
-                // The one shared capture source contains only page content. Both navigation
-                // and the floating titles draw outside it, so neither can sample itself.
-                Box(Modifier.fillMaxSize().then(if (backdrop != null) Modifier.layerBackdrop(backdrop) else Modifier)
-                    .background(MiuixTheme.colorScheme.surface)) {
-                    HorizontalPager(
-                        state = pager,
-                        beyondViewportPageCount = 1,
-                        key = { it },
-                        modifier = Modifier.fillMaxSize().clipToBounds(),
-                    ) { tab ->
-                        Box(Modifier.fillMaxSize().clipToBounds()) {
-                            when (tab) {
-                                1 -> SecurePage(insets, secureScroll, headers[1], secureRequest, { secureRequest = it })
-                                2 -> SkipPage(insets, skipScroll, headers[2], status)
-                                3 -> ThemePage(insets, themeScroll, headers[3], appearance, updateAppearance, accent)
-                                else -> HomePage(insets, homeScroll, headers[0], status, controller,
-                                    loggingEnabled, loggingChanging, changeLogging,
-                                    logExportBusy, logExportMessage, requestLogExport) {
-                                    status = controller.runtimeStatus()
+        val blurRadius = backgroundBlurRadius(appearance.topBlurStrength)
+        Box(Modifier.fillMaxSize().clipToBounds().background(MiuixTheme.colorScheme.surface)) {
+            if (licenseAccepted) {
+                val backgroundPage = if (displayedInfoPage != null) Modifier.clearAndSetSemantics {} else Modifier
+                Scaffold(
+                    modifier = backgroundPage.drawWithContent {
+                        // Keep the pager ready to reveal without drawing it under an opaque page.
+                        if (displayedInfoPage == null || infoOffset > 0f) drawContent()
+                    },
+                    containerColor = MiuixTheme.colorScheme.surface,
+                    bottomBar = {
+                        Box(Modifier.imePadding()) { AppNavigation(selected, pagePosition, navigate, appearance, backdrop, dark) }
+                    },
+                ) { insets ->
+                    val safeTop = pageTopInset(insets)
+                    Box(Modifier.fillMaxSize().background(MiuixTheme.colorScheme.surface)) {
+                        // The capture source contains only page content, below the floating bars.
+                        Box(Modifier.fillMaxSize().then(if (backdrop != null) Modifier.layerBackdrop(backdrop) else Modifier)
+                            .background(MiuixTheme.colorScheme.surface)) {
+                            HorizontalPager(
+                                state = pager,
+                                beyondViewportPageCount = 1,
+                                key = { it },
+                                modifier = Modifier.fillMaxSize().clipToBounds(),
+                            ) { tab ->
+                                Box(Modifier.fillMaxSize().clipToBounds()) {
+                                    when (tab) {
+                                        1 -> SecurePage(insets, secureScroll, headers[1], secureRequest, { secureRequest = it })
+                                        2 -> SkipPage(insets, skipScroll, headers[2], status)
+                                        3 -> ThemePage(insets, themeScroll, headers[3], appearance, updateAppearance, accent)
+                                        else -> HomePage(insets, homeScroll, headers[0], status, controller,
+                                            loggingEnabled, loggingChanging, changeLogging,
+                                            logExportBusy, logExportMessage, requestLogExport, openInfo) {
+                                            status = controller.runtimeStatus()
+                                        }
+                                    }
                                 }
                             }
                         }
+                        PageTopBars(headers, listOf(homeScroll, secureScroll, null, themeScroll), skipScroll,
+                            pagePosition, selected, safeTop, insets, backdrop, blurRadius)
                     }
                 }
-                PageTopBars(headers, listOf(homeScroll, secureScroll, null, themeScroll), skipScroll,
-                    pagePosition, selected, safeTop, insets, backdrop, backgroundBlurRadius(appearance.topBlurStrength))
+            }
+            if (!licenseAccepted) {
+                val promptCovered = if (displayedInfoPage != null) Modifier.clearAndSetSemantics {} else Modifier
+                LicenseConsentPrompt(consentSaving, consentError, readFull = { openInfo(InfoPage.LICENSE) },
+                    agree = { if (displayedInfoPage == null) acceptLicense() },
+                    exit = { if (displayedInfoPage == null) activity.finish() },
+                    modifier = Modifier.matchParentSize().then(promptCovered).drawWithContent {
+                        if (displayedInfoPage == null || infoOffset > 0f) drawContent()
+                    }) {
+                    Footer(compact = true)
+                }
+            }
+            displayedInfoPage?.let { page ->
+                // The revealed strip of the previous page is a preview until Back completes.
+                Box(Modifier.matchParentSize().pointerInput(Unit) {
+                    awaitPointerEventScope {
+                        while (true) awaitPointerEvent().changes.forEach { it.consume() }
+                    }
+                })
+                val infoBackdrop = if (backdrop != null) rememberLayerBackdrop() else null
+                val offerConsent = remember(page) { !licenseAccepted }
+                Scaffold(
+                    modifier = Modifier.fillMaxSize().graphicsLayer { translationX = size.width * infoOffset },
+                    containerColor = MiuixTheme.colorScheme.surface,
+                ) { insets ->
+                    InfoPageContent(page, insets, infoBackdrop, blurRadius,
+                        onAgree = if (offerConsent) ({ if (infoPage == page) acceptLicense() }) else null,
+                        saving = consentSaving) { if (!consentSaving) closeInfo() }
+                }
             }
         }
     }
@@ -544,8 +714,9 @@ private fun backgroundBlurRadius(strength: Float): Float = 22f * strength.let {
 }
 
 @Composable
-private fun PageTopBars(headers: List<PageHeaderState>, lists: List<LazyListState?>, skipScroll: ScrollState,
-                        pagePosition: Float, selected: Int, safeTop: Dp, insets: PaddingValues, backdrop: LayerBackdrop?, blurRadius: Float) {
+private fun PageTopBars(headers: List<PageHeaderState>, lists: List<LazyListState?>, skipScroll: ScrollState?,
+                        pagePosition: Float, selected: Int, safeTop: Dp, insets: PaddingValues, backdrop: LayerBackdrop?,
+                        blurRadius: Float, onBack: (() -> Unit)? = null) {
     val density = LocalDensity.current
     val direction = LocalLayoutDirection.current
     val startPadding = 22.dp + insets.calculateStartPadding(direction)
@@ -562,7 +733,7 @@ private fun PageTopBars(headers: List<PageHeaderState>, lists: List<LazyListStat
     val expandedTopPx = with(density) { (safeTop + 26.dp).toPx() }
     // Every page uses the same home reference, independent of its title glyphs.
     val sharedBarReferenceHeight = with(density) { textMeasurer.measure(
-        headers[0].title, style = titleStyle.copy(fontSize = 20.sp), maxLines = 1, softWrap = false,
+        "自由截图A17", style = titleStyle.copy(fontSize = 20.sp), maxLines = 1, softWrap = false,
     ).size.height.toDp() }
     val barHeight = safeTop + 12.dp + sharedBarReferenceHeight + 36.dp + 18.9.dp
     val blurTransitionPx = with(density) { 32.dp.toPx() }
@@ -570,10 +741,10 @@ private fun PageTopBars(headers: List<PageHeaderState>, lists: List<LazyListStat
     // non-home clamp, then lower it by about 1.5 mm (9.45 dp at baseline density).
     val pinnedTopPx = with(density) {
         val referenceHeight = textMeasurer.measure(
-            headers[1].title, style = titleStyle.copy(fontSize = 20.sp), maxLines = 1, softWrap = false,
+            "窗口保护测试", style = titleStyle.copy(fontSize = 20.sp), maxLines = 1, softWrap = false,
         ).size.height.toFloat()
         val expandedHeight = textMeasurer.measure(
-            headers[1].title, style = titleStyle.copy(fontSize = 31.sp), maxLines = 1, softWrap = false,
+            "窗口保护测试", style = titleStyle.copy(fontSize = 31.sp), maxLines = 1, softWrap = false,
         ).size.height.toFloat()
         val previousOffset = ((48.dp.toPx() + referenceHeight - expandedHeight).coerceAtLeast(0f) / 2f - 18.9.dp.toPx()).coerceAtLeast(0f)
         safeTop.toPx() + previousOffset + 9.45.dp.toPx()
@@ -585,7 +756,7 @@ private fun PageTopBars(headers: List<PageHeaderState>, lists: List<LazyListStat
                 val list = lists[index]
                 val scrollPx = if (list != null) {
                     if (list.firstVisibleItemIndex == 0) list.firstVisibleItemScrollOffset.toFloat() else Float.POSITIVE_INFINITY
-                } else skipScroll.value.toFloat()
+                } else skipScroll?.value?.toFloat() ?: 0f
                 // A restored list may start beyond item zero, before its heading has ever
                 // been composed. Independently measured metrics keep its pinned title ready.
                 val expandedHeightPx = textMeasurer.measure(
@@ -643,8 +814,7 @@ private fun PageTopBars(headers: List<PageHeaderState>, lists: List<LazyListStat
                             ))
                     }
                     if (overlayReady) {
-                        Text(header.title,
-                            modifier = Modifier.offset { IntOffset(0, titleTopPx.roundToInt()) }
+                        val floatingTitle = Modifier.offset { IntOffset(0, titleTopPx.roundToInt()) }
                                 .fillMaxWidth().padding(start = startPadding, end = endPadding)
                                 .graphicsLayer {
                                     // Scale only the title, inside its fixed safe padding.
@@ -653,12 +823,11 @@ private fun PageTopBars(headers: List<PageHeaderState>, lists: List<LazyListStat
                                     scaleX = titleScale
                                     scaleY = titleScale
                                 }
-                                .then(if (selected == index) Modifier.semantics { heading() } else Modifier.clearAndSetSemantics {}),
-                            fontSize = 31.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = titleColor,
-                            maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis,
-                        )
+                        if (onBack != null) InfoPageTitle(header.title, floatingTitle, onBack)
+                        else Text(header.title,
+                            modifier = floatingTitle.then(if (selected == index) Modifier.semantics { heading() } else Modifier.clearAndSetSemantics {}),
+                            fontSize = 31.sp, fontWeight = FontWeight.Bold, color = titleColor,
+                            maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
                     }
                 }
             }
@@ -667,16 +836,29 @@ private fun PageTopBars(headers: List<PageHeaderState>, lists: List<LazyListStat
 }
 
 @Composable
-private fun PageList(insets: PaddingValues, state: LazyListState, content: androidx.compose.foundation.lazy.LazyListScope.() -> Unit) {
+internal fun PageList(insets: PaddingValues, state: LazyListState, bottomPadding: Dp = 154.dp,
+                      content: androidx.compose.foundation.lazy.LazyListScope.() -> Unit) {
     val direction = LocalLayoutDirection.current
     LazyColumn(
         modifier = Modifier.fillMaxSize().imePadding(),
         state = state,
         contentPadding = PaddingValues(start = 22.dp + insets.calculateStartPadding(direction),
-            end = 22.dp + insets.calculateEndPadding(direction), top = pageTopInset(insets) + 26.dp, bottom = 154.dp),
+            end = 22.dp + insets.calculateEndPadding(direction), top = pageTopInset(insets) + 26.dp, bottom = bottomPadding),
         verticalArrangement = Arrangement.spacedBy(18.dp),
         content = content,
     )
+}
+
+@Composable
+private fun pageEyebrowHeight(): Dp {
+    // The version pill used to make only home's eyebrow taller. Give all four
+    // rows its font-scaled height so the title starts and moves on the same line.
+    val textMeasurer = rememberTextMeasurer()
+    return with(LocalDensity.current) { textMeasurer.measure(
+        BuildConfig.VERSION_NAME,
+        style = MiuixTheme.textStyles.main.copy(fontSize = 11.sp, fontWeight = FontWeight.SemiBold),
+        maxLines = 1, softWrap = false,
+    ).size.height.toDp() + 12.dp }
 }
 
 @Composable
@@ -684,14 +866,7 @@ private fun PageHeading(header: PageHeaderState, eyebrow: String, subtitle: Stri
     // Capture in composition: the first frame is painted here, then both layers switch
     // ownership together once placement has provided the floating title's exact anchor.
     val overlayReady = header.titleHeightPx > 0f
-    // The version pill used to make only home's eyebrow taller. Give all four
-    // rows its font-scaled height so the title starts and moves on the same line.
-    val textMeasurer = rememberTextMeasurer()
-    val eyebrowHeight = with(LocalDensity.current) { textMeasurer.measure(
-        BuildConfig.VERSION_NAME,
-        style = MiuixTheme.textStyles.main.copy(fontSize = 11.sp, fontWeight = FontWeight.SemiBold),
-        maxLines = 1, softWrap = false,
-    ).size.height.toDp() + 12.dp }
+    val eyebrowHeight = pageEyebrowHeight()
     Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(bottom = 2.dp)) {
         Row(Modifier.fillMaxWidth().heightIn(min = eyebrowHeight), verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -716,7 +891,8 @@ private fun PageHeading(header: PageHeaderState, eyebrow: String, subtitle: Stri
 @Composable
 private fun HomePage(insets: PaddingValues, scroll: LazyListState, header: PageHeaderState, status: RuntimeStatus, controller: CompatController,
                      loggingEnabled: Boolean, loggingChanging: Boolean, changeLogging: (Boolean) -> Unit,
-                     logExportBusy: Boolean, logExportMessage: String, exportLogs: () -> Unit, settingsChanged: () -> Unit) {
+                     logExportBusy: Boolean, logExportMessage: String, exportLogs: () -> Unit,
+                     openInfo: (InfoPage) -> Unit, settingsChanged: () -> Unit) {
     val context = LocalContext.current
     var showCaptureTools by remember { mutableStateOf(false) }
     if (showCaptureTools) CaptureToolPicker(controller.getCaptureToolPackages(),
@@ -773,6 +949,8 @@ private fun HomePage(insets: PaddingValues, scroll: LazyListState, header: PageH
                     Box(Modifier.size(9.dp).background(if (matching) Color(0xFFEDA345) else if (policyMissing || (ready && paused)) Color(0xFF8590A0) else if (ready) Color(0xFF26B889) else Color(0xFFEDA345), CircleShape))
                     Text(when {
                         matching -> "正在匹配兼容"
+                        status.nativeHealthSnapshotStale && status.nativeHealthRefreshPending -> "正在刷新运行状态"
+                        status.nativeHealthSnapshotStale -> "运行状态待确认"
                         policyMissing -> "采集仲裁未运行"
                         ready && policyPaused -> "图层兼容按排除规则暂停"
                         ready && paused -> "截屏与录屏兼容已暂停"
@@ -782,8 +960,13 @@ private fun HomePage(insets: PaddingValues, scroll: LazyListState, header: PageH
                     }, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
                 }
                 Spacer(Modifier.height(10.dp))
-                Caption(if (!status.arbitrationEnabled && status.message == CompatController.ARBITRATION_NOT_RUNNING)
-                    "当前设置已同步，录屏变更需停止并重新开始录屏" else status.message)
+                Caption(when {
+                    status.nativeHealthSnapshotStale && status.nativeHealthRefreshPending -> "正在向系统模块请求新状态"
+                    status.nativeHealthSnapshotStale -> "暂未收到系统模块的新状态，可点“刷新状态”重试"
+                    !status.arbitrationEnabled && status.message == CompatController.ARBITRATION_NOT_RUNNING ->
+                        "当前设置已同步，录屏变更需停止并重新开始录屏"
+                    else -> status.message
+                })
                 Spacer(Modifier.height(16.dp))
                 RuntimeLine("框架", status.frameworkDetails)
                 Spacer(Modifier.height(12.dp))
@@ -810,6 +993,9 @@ private fun HomePage(insets: PaddingValues, scroll: LazyListState, header: PageH
                     Caption(logExportMessage)
                 }
             }
+        }
+        item {
+            NativeHealthIntervalSettings(controller, settingsChanged)
         }
         item {
             SectionLabel("兼容总开关")
@@ -898,7 +1084,79 @@ private fun HomePage(insets: PaddingValues, scroll: LazyListState, header: PageH
                 })
             }
         }
+        item {
+            Card(cornerRadius = 24.dp, insideMargin = PaddingValues(20.dp)) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Button(onClick = { openInfo(InfoPage.SUPPORT) }, modifier = Modifier.weight(1f)) { Text("支持") }
+                    Button(onClick = { openInfo(InfoPage.LICENSE) }, modifier = Modifier.weight(1f)) { Text("许可证") }
+                }
+            }
+        }
         item { Footer() }
+    }
+}
+
+@Composable
+private fun NativeHealthIntervalSettings(controller: CompatController, onSaved: () -> Unit) {
+    val context = LocalContext.current
+    val keyboard = LocalSoftwareKeyboardController.current
+    var saved by remember(controller) { mutableIntStateOf(controller.getHealthIntervalSeconds()) }
+    var draft by rememberSaveable { mutableStateOf(saved.toString()) }
+    var saving by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    Card(cornerRadius = 24.dp, insideMargin = PaddingValues(20.dp)) {
+        Text("原生检查间隔", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(8.dp))
+        Caption(if (saved == 0) "已保存：关闭定时检查" else "已保存：$saved 秒")
+        Caption("输入 0 关闭定时检查。主页状态过期时会自动刷新。")
+        Spacer(Modifier.height(12.dp))
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            BasicTextField(
+                value = draft,
+                onValueChange = { value ->
+                    if (value.length <= 16 && value.all { it in '0'..'9' }) {
+                        draft = value
+                        error = null
+                    }
+                },
+                enabled = !saving,
+                singleLine = true,
+                textStyle = TextStyle(fontSize = 16.sp, color = MiuixTheme.colorScheme.onSurface),
+                cursorBrush = SolidColor(MiuixTheme.colorScheme.primary),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.weight(1f).clip(RoundedCornerShape(12.dp))
+                    .background(MiuixTheme.colorScheme.surface).padding(14.dp),
+                decorationBox = { field ->
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Box(Modifier.weight(1f)) { field() }
+                        Caption("秒")
+                    }
+                },
+            )
+            Button(onClick = {
+                val seconds = draft.toIntOrNull()
+                if (seconds == null || seconds !in 0..CompatController.MAX_HEALTH_INTERVAL_SECONDS) {
+                    error = "请输入 0–${CompatController.MAX_HEALTH_INTERVAL_SECONDS} 秒的整数"
+                } else {
+                    saving = true
+                    error = null
+                    controller.setHealthIntervalSeconds(seconds) { success ->
+                        saving = false
+                        if (success) {
+                            saved = controller.getHealthIntervalSeconds()
+                            draft = saved.toString()
+                            keyboard?.hide()
+                            onSaved()
+                            Toast.makeText(context, "检查间隔已保存", Toast.LENGTH_SHORT).show()
+                        } else error = "保存失败，请重试"
+                    }
+                }
+            }, enabled = !saving && draft.isNotEmpty()) { Text(if (saving) "保存中…" else "保存") }
+        }
+        error?.let {
+            Spacer(Modifier.height(6.dp))
+            Text(it, fontSize = 12.sp, color = MiuixTheme.colorScheme.error)
+        }
     }
 }
 
@@ -924,6 +1182,7 @@ private fun SecurePage(insets: PaddingValues, scroll: LazyListState, header: Pag
             }
         }
         item { Caption("此测试只设置窗口保护，不设置 SKIP_SCREENSHOT。两个测试互相独立。") }
+        item { Footer() }
     }
 }
 
@@ -1028,6 +1287,7 @@ private fun SkipPage(insets: PaddingValues, scroll: ScrollState, header: PageHea
             }
         }
         Caption("左右切页和上下滚动均保留真实测试图层，不叠加普通图案预览。绿色表示本次请求与真实绘制已同步；实际效果以保存的截图为准。")
+        Footer()
     }
 }
 
@@ -1166,7 +1426,7 @@ private fun UpperLayerColorPicker(color: Long, enabled: Boolean, choose: (Long) 
     var error by remember { mutableStateOf(false) }
     val swatches = listOf(
         "黑色" to 0xFF000000, "白色" to 0xFFFFFFFF, "蓝色" to 0xFF3478F6, "绿色" to 0xFF02A88B,
-        "紫色" to 0xFF885ADD, "橙色" to 0xFFF17843, "红色" to 0xFFD34A81, "灰色" to 0xFF596B7C,
+        "紫色" to 0xFF885ADD, "橙色" to 0xFFF17843, "红色" to DEFAULT_ACCENT_COLOR, "灰色" to 0xFF596B7C,
     )
     Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("上层颜色", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
@@ -1336,26 +1596,108 @@ private fun PalettePreview(accent: Color) {
 }
 
 @Composable
-private fun Footer() {
+private fun InfoPageContent(page: InfoPage, insets: PaddingValues, backdrop: LayerBackdrop?, blurRadius: Float,
+                            onAgree: (() -> Unit)?, saving: Boolean, goBack: () -> Unit) {
+    key(page) {
+        val scroll = rememberLazyListState()
+        val header = remember { PageHeaderState(page.title) }
+        val heading: @Composable () -> Unit = {
+            val overlayReady = header.titleHeightPx > 0f
+            Column {
+                Spacer(Modifier.height(pageEyebrowHeight() + 8.dp))
+                InfoPageTitle(header.title, Modifier.fillMaxWidth()
+                    .graphicsLayer { alpha = if (overlayReady) 0f else 1f }
+                    .then(if (overlayReady) Modifier.clearAndSetSemantics {} else Modifier)
+                    .onGloballyPositioned {
+                        header.titleOffsetPx = it.positionInParent().y
+                        header.titleHeightPx = it.size.height.toFloat()
+                    }, if (overlayReady) null else goBack)
+            }
+        }
+        Box(Modifier.fillMaxSize().background(MiuixTheme.colorScheme.surface)) {
+            Box(Modifier.fillMaxSize().then(if (backdrop != null) Modifier.layerBackdrop(backdrop) else Modifier)
+                .background(MiuixTheme.colorScheme.surface)) {
+                when (page) {
+                    InfoPage.SUPPORT -> AppSupportPage(insets, scroll, heading) { Footer() }
+                    InfoPage.LICENSE -> AppLicensePage(insets, scroll, heading, onAgree, saving) { Footer() }
+                }
+            }
+            PageTopBars(listOf(header), listOf(scroll), null, 0f, 0, pageTopInset(insets),
+                insets, backdrop, blurRadius, onBack = goBack)
+        }
+    }
+}
+
+@Composable
+private fun InfoPageTitle(title: String, modifier: Modifier, onBack: (() -> Unit)?) {
+    val color = MiuixTheme.colorScheme.onSurface
+    Row(modifier, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Box(Modifier.size(48.dp).then(if (onBack != null) Modifier.clickable(role = Role.Button, onClick = onBack) else Modifier),
+            contentAlignment = Alignment.Center) {
+            Icon(AppIcons.Back, if (onBack != null) "返回" else null, Modifier.size(26.dp), tint = color)
+        }
+        Text(title, fontSize = 31.sp, fontWeight = FontWeight.Bold, color = color,
+            maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f).semantics { heading() })
+    }
+}
+
+private const val PROJECT_URL = "https://github.com/hawyn2018/screenshot_freedom_A17"
+
+private data class FooterContact(val text: String, val url: String, val clipboard: String, val copyLabel: String,
+                                 val fallbackUrl: String? = null, val error: String = "打开链接失败，请长按复制后访问")
+
+private val authorContacts = listOf(
+    FooterContact("QQ 交流群：941336897", "mqqapi://card/show_pslcard?src_type=internal&version=1&uin=941336897&card_type=group&source=qrcode",
+        "941336897", "QQ群号", error = "打开QQ群入口失败，可长按复制群号后在QQ中搜索"),
+    FooterContact("闲鱼：2018hawyn", "https://m.tb.cn/h.jgDi6un?tk=4QbA6Z6JhAO", "https://m.tb.cn/h.jgDi6un?tk=4QbA6Z6JhAO", "闲鱼链接"),
+    FooterContact("酷安：hawyn", "coolmarket://u/43879986", "hawyn", "酷安用户名", "https://www.coolapk.com/u/43879986"),
+    FooterContact("Telegram 群组：blroot", "https://t.me/blroot", "blroot", "Telegram群组名"),
+)
+
+@Composable
+private fun Footer(compact: Boolean = false) {
     val context = LocalContext.current
     val uriHandler = LocalUriHandler.current
-    val githubUrl = "https://github.com/hawyn2018/screenshot_freedom_A17"
-    val linkColor = MiuixTheme.colorScheme.primary
-    val githubLink = buildAnnotatedString {
-        withLink(LinkAnnotation.Url(githubUrl,
-            styles = TextLinkStyles(style = SpanStyle(color = linkColor)),
-            linkInteractionListener = {
-                runCatching { uriHandler.openUri(githubUrl) }.onFailure {
-                    Toast.makeText(context, "未找到可打开链接的应用", Toast.LENGTH_SHORT).show()
-                }
-            })) { append(githubUrl) }
-    }
-    Column(Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-        Text("自由截图A17  ${BuildConfig.VERSION_NAME}\n作者：Hawyn; Codex", fontSize = 11.sp, lineHeight = 19.sp,
+    val entries = if (compact) {
+        authorContacts + FooterContact(PROJECT_URL.removePrefix("https://"), PROJECT_URL, PROJECT_URL, "GitHub链接")
+    } else authorContacts
+    Column(Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(if (compact) 6.dp else 8.dp)) {
+        Text("自由截图A17  ${BuildConfig.VERSION_NAME}", fontSize = 11.sp, lineHeight = 19.sp,
             color = MiuixTheme.colorScheme.onSurfaceVariantSummary, textAlign = TextAlign.Center)
-        SelectionContainer {
-            Text(githubLink, fontSize = 11.sp, lineHeight = 19.sp, color = MiuixTheme.colorScheme.primary,
-                textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
+        Text("作者官方联系方式如下，其他来源请勿轻信！", fontSize = 11.sp, lineHeight = 19.sp,
+            color = MiuixTheme.colorScheme.onSurfaceVariantSummary, textAlign = TextAlign.Center)
+        for (entry in entries) {
+            Text(entry.text, fontSize = 11.sp, lineHeight = 19.sp, color = MiuixTheme.colorScheme.primary,
+                textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+                    .combinedClickable(onClickLabel = "打开${entry.copyLabel}", onLongClickLabel = "复制${entry.copyLabel}",
+                        onClick = {
+                            val opened = runCatching { uriHandler.openUri(entry.url) }.isSuccess ||
+                                (entry.fallbackUrl?.let { runCatching { uriHandler.openUri(it) }.isSuccess } == true)
+                            if (!opened) Toast.makeText(context, entry.error, Toast.LENGTH_SHORT).show()
+                        },
+                        onLongClick = {
+                            val copied = runCatching {
+                                requireNotNull(context.getSystemService(ClipboardManager::class.java))
+                                    .setPrimaryClip(ClipData.newPlainText(entry.copyLabel, entry.clipboard))
+                            }.isSuccess
+                            Toast.makeText(context, if (copied) "已复制${entry.copyLabel}" else "复制失败，请稍后重试", Toast.LENGTH_SHORT).show()
+                        }).padding(horizontal = 8.dp))
+        }
+        if (!compact) {
+            val link = buildAnnotatedString {
+                withLink(LinkAnnotation.Url(PROJECT_URL, styles = TextLinkStyles(style = SpanStyle(color = MiuixTheme.colorScheme.primary)),
+                    linkInteractionListener = {
+                        runCatching { uriHandler.openUri(PROJECT_URL) }.onFailure {
+                            Toast.makeText(context, "打开链接失败，请长按选择并复制后访问", Toast.LENGTH_SHORT).show()
+                        }
+                    })) { append(PROJECT_URL) }
+            }
+            SelectionContainer {
+                Text(link, fontSize = 11.sp, lineHeight = 19.sp, textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth())
+            }
         }
     }
 }
@@ -1367,6 +1709,10 @@ private object AppIcons {
                 strokeLineCap = androidx.compose.ui.graphics.StrokeCap.Round,
                 strokeLineJoin = androidx.compose.ui.graphics.StrokeJoin.Round, pathBuilder = draw)
         }.build()
+    val Back = vector("Back") {
+        moveTo(20f, 12f); lineTo(4f, 12f)
+        moveTo(10f, 6f); lineTo(4f, 12f); lineTo(10f, 18f)
+    }
     val Home = vector("Home") {
         moveTo(3f, 10.5f); lineTo(12f, 3f); lineTo(21f, 10.5f)
         moveTo(5f, 9f); lineTo(5f, 20f); lineTo(10f, 20f); lineTo(10f, 14f); lineTo(14f, 14f); lineTo(14f, 20f); lineTo(19f, 20f); lineTo(19f, 9f)

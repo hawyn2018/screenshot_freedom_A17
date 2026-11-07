@@ -1,116 +1,106 @@
-# 自由截图A17 / Screenshot Freedom A17
+<p align="center">
+  <a href="#qq-group">QQ 交流群 941336897</a> ·
+  <a href="https://t.me/blroot">Telegram @blroot</a>
+</p>
+<p align="center"><img src="docs/app-icon.svg" width="104" height="104" alt="自由截图 A17 应用图标"></p>
+<h1 align="center">自由截图 A17 · Screenshot Freedom A17</h1>
+<p align="center">
+  <a href="#qq-group">QQ 群 941336897</a> ·
+  <a href="https://t.me/blroot">Telegram @blroot</a> ·
+  <a href="https://www.coolapk.com/u/43879986">酷安 hawyn</a> ·
+  <a href="https://m.tb.cn/h.jgDi6un?tk=4QbA6Z6JhAO">闲鱼 2018hawyn</a>
+</p>
+<p align="center">
+  <a href="#zh-cn">中文版</a> · <a href="#en">English</a> ·
+  <a href="https://github.com/hawyn2018/screenshot_freedom_A17/releases/tag/v3.6.7">v3.6.7 源码 / Source</a>
+</p>
 
-**应用版本 3.5.9 · versionCode 43 · 系统组件 3.5.9**
+<a name="zh-cn"></a>
 
-包名：`net.hawyn.screenshotfreedoma17`  
-作者：Hawyn; Codex
+## 中文版
 
-系统截图与录屏兼容模块，包含 Android 应用、LSPosed 系统侧模块和独立原生系统组件。
+自由截图 A17 为解除 Android 17 的截图限制而来。在解除部分软件窗口截图限制的基础上，增加了禁止截图图层排除的功能。两项机制可分别开启，并可用于受支持的截图、录屏和 ADB 投屏链路。
 
-## 功能
+### 安装与验证
 
-- 两个总开关分别控制 `FLAG_SECURE` 窗口限制与 `SKIP_SCREENSHOT` 图层排除兼容。
-- 采集工具黑名单、白名单独立保存，各工具分别设置两种机制；新安装默认关闭名单仲裁。
-- 提供真实窗口保护、图层排除测试页，以及 Monet 动态主题和悬浮底栏。
-- 四页标题随上滑上浮并缩至原尺寸的 75%，顶部与底部模糊强度分别调节。
-- 诊断日志默认关闭；需要排障时开启并复现问题，再手动导出 ZIP，Root 可补充固定范围的诊断资料。
-- 自动选择可信系统映射读取方式，成功后缓存并在复用时重新校验。
-- 3.4.5 桌面图标采用前景、背景分离的 Adaptive Icon，沿用系统 Monet 配色。
+1. 按[构建说明](#build)生成并安装自己的签名 APK。首次打开时，可阅读完整许可证，再确认或退出。
+2. **窗口保护**：在兼容 libxposed API 102 的 LSPosed 框架中启用「自由截图 A17」，勾选推荐的「系统框架」作用域，然后按框架提示重启。若系统厂商在独立截图或录屏进程中额外检查结果或显示提示，可按设备实际情况加入对应的**系统采集组件**，再重新加载。保持被采集的普通应用在作用域之外。
+3. **图层排除与采集仲裁**：在有 Root 的设备上，点击首页「安装/更新系统模块」，或通过 KernelSU 安装构建生成的系统模块 ZIP。按管理器提示重启，回到首页确认截图子层、录屏子层和采集仲裁状态。应用版本为 **3.6.7**，配套系统模块版本为 **3.6.1**。
+4. 在首页按需打开下表中的开关。分别在「窗口测试」和「图层测试」使用系统截图或录屏，检查保存文件中的四色、字母和图案编号。改变录屏配置后，请停止旧录屏再开始。ADB 投屏也可断开重连后对照测试。
 
-应用采用系统级作用域，按实际接口及代码语义适配；具体设备支持情况以实际使用为准。
-采集入口仍沿用系统原有权限和 MediaProjection 授权。
+| 首页开关 | 作用 |
+| --- | --- |
+| 解除窗口限制 · `DISABLE_FLAG_SECURE` | 处理部分应用给窗口设置的 `FLAG_SECURE` 及受支持的系统采集结果检查。 |
+| 阻止图层排除 · `DISABLE_SKIP_SCREENSHOT` | 尝试让系统采集保留被标记为排除的子图层。效果取决于设备的 SurfaceFlinger 实现及采集路径。 |
 
-## 更新记录
+### 采集工具名单、状态与诊断
 
-完整版本列表见 [CHANGELOG.md](CHANGELOG.md)。
+- **采集工具名单**针对发起截图、录屏或投屏的工具。关闭仲裁时，所有采集工具可按首页开关获得兼容。开启后，黑名单限制已勾选的工具，白名单仅允许已勾选的工具。两种名单独立保存，每个工具可分别配置 `FLAG_SECURE` 和 `SKIP_SCREENSHOT`。新安装默认关闭仲裁。
+- **检查间隔**可填 0–86400 秒。新安装默认 **0 秒**，关闭后台定时完整检查。主页在前台亮屏时会主动刷新过期状态；退到后台或退出后，原生定时检查按保存值运行。
+- **日志**默认关闭。排查问题时开启日志、复现，再手动点击「导出日志」。ZIP 保存到 Download，格式为 `screenshotfreedom_log_版本_yyyyMMdd_HHmmss.zip`。Root 可补充诊断数据。
+- **兼容范围**取决于设备和采集入口。ADB 投屏支持经系统 DisplayManager 建立的部分自动镜像，例如走此入口的 scrcpy；旧式或厂商私有路径需实测。系统权限和 MediaProjection 授权仍照常适用。仅有应用和框架时可验证窗口兼容；图层排除和名单仲裁还依赖原生系统模块。
 
-### 3.5.9
+[切换到 English](#en)
 
-- **可选日志**：主页新增“日志记录”开关，新安装及从诊断版升级均默认关闭。开启后记录运行、安装和错误现场，由用户手动导出；关闭时停止诊断收集，清理应用私有日志与临时文件，保留已导出 ZIP、功能状态和兼容性缓存。
-- **文件身份自动适配**：针对 `module_identity_changed`，从可信进程 `exe`、精确 `map_files` 句柄或严格匹配的路径选择读取方式，分别校验内核映射身份与文件 stat 身份。保留进程、ELF、实时函数和补丁归属校验，不按品牌、机型或版本号放行。
-- **适配缓存**：成功的读取策略保存至 `/data/adb/enable_screenshot17fix/compat-cache/access.cache`，优先复用并验证；失效时重新匹配，不持久化 PID 或临时内存地址。
-- **安装恢复**：旧组件恢复失败时，临时新版 helper 重新校验恢复。确认状态后才覆盖；超时保留后台完成观察并阻止重复安装，避免强杀正在恢复的原生进程。
+<a name="en"></a>
 
-应用和系统模块均更新为 3.5.9，使用本次原生修复需同步更新系统模块。日志文件名为 `screenshotfreedom_log_3.5.9_yyyyMMdd_HHmmss.zip`，保存于 Download。
-离线编译、签名与回归检查通过；本版未进行实机验证或推送安装，具体设备效果以实际使用为准。
+## English
 
-### 3.5.6
+Screenshot Freedom A17 was built to lift Android 17 screenshot restrictions. It can lift window-level screenshot restrictions for some apps and adds a separate option to prevent layers from being excluded from capture. Both mechanisms can be configured independently for supported screenshot, recording, and ADB mirroring paths.
 
-- **标题上浮与缩放**：四页大标题随上滑移入顶栏，停靠时缩至原尺寸的 75%；停稳后的左上角位置保持固定，回到顶部恢复。
-- **统一顶部效果**：模糊从屏幕顶部覆盖状态栏，向下渐变至透明；四页共用模糊范围、强度曲线和标题位置规则，并修正渐变发黑问题。
-- **上下模糊独立调节**：主题页分别提供“顶部模糊强度”和“底部模糊强度”，范围均为 0%–200%。顶部作用于状态栏和四页顶栏，底部作用于两种液态玻璃底栏。
-- **保留原设置**：升级后两项分别继承旧全局模糊值，之后独立保存；原有主题、色彩和透明度设置保留。
+### Installation and verification
 
-本次汇总 3.4.8 至 3.5.6 的最终界面更新。截图/录屏、名单仲裁、Binder 入口鉴权和原生组件沿用 3.4.7，系统组件仍为 3.4.2。
-构建、签名、包体、设置迁移及 root 安装核验通过；完整外观由用户手动检查。
+1. Follow the [build instructions](#build) to generate and install an APK signed with your own key. On first launch, you can read the full license before accepting or exiting.
+2. **Window protection:** Enable Screenshot Freedom A17 in an LSPosed framework compatible with libxposed API 102, select the recommended **System Framework** scope, and restart as prompted. If an OEM checks results or displays warnings in a separate screenshot or recording process, add the corresponding **system capture component** to the scope as needed and reload. Keep ordinary apps being captured outside the scope.
+3. **Layer exclusion and capture-tool rules:** On a rooted device, choose **Install / update system module** on the home page, or install the system module ZIP produced by the build through KernelSU. Restart as instructed by the manager, then check the screenshot layer, recording layer, and capture-tool arbitration statuses on the home page. The app version is **3.6.7** and the companion module version is **3.6.1**.
+4. Enable the switches below as needed. Use your system screenshot or recording controls on the **Window Test** and **Layer Test** pages, then check the saved file for all four colors, the letters, and the pattern number. Restart recording after changing its settings. Reconnect ADB mirroring when comparing results.
 
-### 3.4.7
+| Home switch | What it does |
+| --- | --- |
+| `DISABLE_FLAG_SECURE` | Handles the `FLAG_SECURE` window setting used by some apps and supported system capture result checks. |
+| `DISABLE_SKIP_SCREENSHOT` | Attempts to retain child layers marked for exclusion. Results depend on the device's SurfaceFlinger implementation and capture path. |
 
-- **修复框架 Binder 投递入口鉴权**：使用实际 Binder 调用方 UID，仅接受 root（0）和 system（1000）。普通应用及其他 UID 的投递会在进入 SDK 前被拒绝，不替换已连接的服务，也不向其同步设置或名单。
-- **GitHub 链接支持选择复制**：保留点击浏览，新增长按选择文字与复制；主页和主题页共用。
-- **统一机制标签排版**：“解除窗口限制”下的 `DISABLE_FLAG_SECURE` 与“阻止图层排除”下的 `DISABLE_SKIP_SCREENSHOT` 使用相同字号，各占一行，并随可用宽度共同调整。
+### Capture tools, status, and diagnostics
 
-保留原 libxposed authority、投递协议和 SDK 初始化行为，不按框架名称、包名、签名或版本筛选。
-截图/录屏 hook、名单仲裁、原生程序和系统组件未变，组件仍为 3.4.2。
-已通过构建、签名、包体核验及入口鉴权主机验证；实际框架分支兼容性以设备验证为准。
+- **Capture-tool lists** apply to the tool initiating a screenshot, recording, or mirror session. With arbitration off, the home switches apply to all capture tools. With arbitration on, the blocklist restricts selected tools and the allowlist permits only selected tools. The lists are stored separately and each tool has its own `FLAG_SECURE` and `SKIP_SCREENSHOT` options. Arbitration is off by default on fresh installs.
+- **Check interval** accepts 0–86,400 seconds. Fresh installs use **0 seconds**, which turns off scheduled full checks in the background. The home page requests a refresh when status expires while the app is visible and the screen is on. Scheduled native checks use the saved interval when the app is in the background or closed.
+- **Diagnostic logging** is off by default. To troubleshoot, turn it on, reproduce the issue, and choose **Export logs**. The ZIP is saved to Download as `screenshotfreedom_log_version_yyyyMMdd_HHmmss.zip`. Root access can provide additional diagnostics.
+- **Compatibility** varies by device and capture entry point. ADB mirroring covers some automatic-mirroring paths through the system DisplayManager, such as scrcpy when it uses that path. Older and OEM-specific paths require device testing. System permissions and MediaProjection approval still apply. You can test window compatibility with the app and framework alone. Layer exclusion and capture-tool arbitration also require the native system module.
 
-## 安装与升级
+[切换到中文版](#zh-cn)
 
-本仓库仅发布源码，不创建 GitHub Release。
-使用自己构建的 APK，在 LSPosed 中启用“自由截图A17”并设置对应系统作用域。
-原生图层兼容需要安装构建生成的系统模块，或使用应用内“安装/更新系统模块”。
-升级至 3.5.9 时请一并更新系统模块，单独更新 APK 不会替换已安装的原生程序。
-同包名 APK 覆盖升级要求签名证书一致；这里没有原发布者的签名私钥，
-使用自己的签名构建时应按独立签名应用安装，已有配置请自行备份。
-框架及系统模块切换按各管理器提示完成，避免同时启用重复的兼容模块。
+<a name="build"></a>
 
-## 从源码构建
+## 从源码构建 · Build from source
 
-当前完整打包脚本针对 Windows，准备以下环境：
+完整构建脚本面向 Windows。需要 Python 3、JDK 21、Android SDK Platform 37、Build Tools 37.0.0 和 Android NDK r29。仓库已包含 Gradle Wrapper，首次构建需下载依赖。当前原生组件构建目标为 `arm64-v8a`。
 
-- Python 3、Git、JDK 21；Gradle Wrapper 已包含在仓库中。
-- Android SDK Platform 37、Build Tools 37.0.0。
-- Android NDK r29，原生系统组件当前构建为 `arm64-v8a`。
-- 按 `app/gradle.lockfile` 锁定的依赖版本，首次构建需要联网下载。
+The full packaging script targets Windows. Install Python 3, JDK 21, Android SDK Platform 37, Build Tools 37.0.0, and Android NDK r29. The Gradle Wrapper is included and the first build downloads dependencies. The current native build targets `arm64-v8a`.
 
-在 PowerShell 中配置自己的安装路径，例如：
+在 PowerShell 配置自己的工具路径并生成本地密钥库。 / Set your tool paths and create a local keystore in PowerShell.
 
 ```powershell
 $env:JAVA_HOME = 'C:\path\to\jdk-21'
 $env:ANDROID_SDK_ROOT = 'D:\path\to\AndroidSDK'
 $env:ANDROID_NDK_HOME = 'D:\path\to\AndroidSDK\ndk\android-ndk-r29'
-```
 
-正式打包需要自己的签名材料。先创建已被 Git 忽略的 `signing` 目录，
-再通过交互式 `keytool` 生成密钥：
-
-```powershell
 New-Item -ItemType Directory -Force signing
 keytool -genkeypair -keystore signing/screenshot-compat.jks -alias screenshotcompat -keyalg RSA -keysize 3072 -validity 10000
 ```
 
-将相同的密钥库口令仅保存在本地 `signing/keystore.pass` 文件中，然后运行：
+将密钥库口令保存到本地 `signing/keystore.pass`，再运行 `python tools/build.py`。脚本会编译原生组件、生成并签名 APK，输出到 `dist/`。覆盖安装要求 APK 签名证书一致。
 
-```powershell
-python tools/build.py
-```
+Save the keystore password locally in `signing/keystore.pass`, then run `python tools/build.py`. The script builds the native companion and signs the APK, with outputs in `dist/`. An in-place Android upgrade requires the same signing certificate.
 
-脚本会先从 `native/` 重建原生程序、准备应用资产，再构建并签名 APK。
-输出位于 `dist/`：应用 APK、源码包、系统模块 ZIP、校验文件及公开签名证书。
-`--ui-only` 和 `--app-only` 是原开发工作区的历史版本比对模式，依赖本地封存的 `releases/`；
-公开源码仓库应使用上述完整构建命令。
-3.5.9 完整构建在两份开发者历史比对输入均缺失时明确跳过该项比对；仅缺一份或文件损坏仍报错。
-原生重建、Gradle、签名、对齐与最终 APK 校验照常执行。
+## 更新记录与许可证 · Changelog and license
 
-## 源码范围
+- [更新记录 / Changelog](CHANGELOG.md) · [源码校验记录 / Source snapshot](SOURCE_SNAPSHOT.json)
+- 项目自有代码使用 **GNU Affero General Public License v3.0 only（AGPL-3.0-only）**，与应用内许可一致。第三方内容各自适用其原许可证。
+- The project's own code is licensed under **GNU Affero General Public License v3.0 only (AGPL-3.0-only)**, matching the in-app license. Third-party material retains its respective license.
+- [AGPLv3 原文 / License text](LICENSE.txt) · [第三方声明 / Third-party notices](NOTICE.txt)
 
-源码来自已交付的 3.5.9 封存源码包，应用和原生功能源码保持原样。
-公开构建脚本仅增加缺少本地历史封存包时的比对跳过分支，差异记录于 `SOURCE_SNAPSHOT.json`。
-公开快照不包含发布签名材料、访问令牌、设备日志、历史设备验证脚本和报告、
-构建缓存、生成的原生二进制、APK 或历史发布产物。
-`SOURCE_SNAPSHOT.json` 记录原始源码包校验值及保留源码文件的校验值。
+<a name="qq-group"></a>
 
-## 许可证
+### QQ 交流群 · QQ group
 
-项目使用 **GNU General Public License v3.0 (GPL-3.0)**。
-完整许可证见 [LICENSE.txt](LICENSE.txt)，第三方依赖与来源声明见 [NOTICE.txt](NOTICE.txt)。
+在 QQ 的群搜索中输入 **941336897**。 / In QQ, search for group **941336897**.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 #include "policy_broker.hpp"
 #include <algorithm>
 #include <array>
@@ -15,10 +15,12 @@
 #include <poll.h>
 #include <set>
 #include <sstream>
+#include <string_view>
 #include <sys/file.h>
 #include <sys/inotify.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/xattr.h>
 #include <thread>
@@ -29,7 +31,17 @@ namespace sfpolicy {
 namespace {
 constexpr const char* kStateDirectory = "/data/adb/enable_screenshot17fix";
 volatile sig_atomic_t stopping = 0;
-void stopSignal(int) { stopping = 1; }
+volatile sig_atomic_t stopWakeFd = -1;
+void stopSignal(int) {
+    int saved = errno;
+    stopping = 1;
+    if (stopWakeFd >= 0) {
+        const char byte = 1;
+        ssize_t ignored = write(stopWakeFd, &byte, 1);
+        (void)ignored;
+    }
+    errno = saved;
+}
 struct FatalTrace : std::runtime_error { using std::runtime_error::runtime_error; };
 struct Fd {
     int fd = -1;
@@ -37,8 +49,15 @@ struct Fd {
     ~Fd() { if (fd >= 0) close(fd); }
     Fd(const Fd&) = delete;
     Fd& operator=(const Fd&) = delete;
+    void reset(int next = -1) { if (fd >= 0) close(fd); fd = next; }
 };
 using Clock = std::chrono::steady_clock;
+constexpr int kStatusTtlMs = 75000;
+constexpr int kDefaultHealthIntervalSeconds = 60;
+constexpr int kMaxHealthIntervalSeconds = 86400;
+constexpr const char* kHealthIntervalFile = "sf17fix-health-interval.conf";
+constexpr auto kFallbackInterval = std::chrono::seconds(5);
+constexpr auto kMinimumCheckGap = std::chrono::milliseconds(300);
 std::string q(const std::string& value) {
     std::string out = "\"";
     for (unsigned char c : value) { if (c == '"' || c == '\\') out += '\\'; out += c >= 32 && c < 127 ? char(c) : '?'; }
@@ -59,7 +78,7 @@ std::string canonicalDirectory(const std::string& path, bool rootOwned) {
     return resolved.data();
 }
 std::string privateText(const std::string& path, uid_t owner, size_t limit, bool missingAllowed = false) {
-    Fd fd(open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+    Fd fd(open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
     if (fd.fd < 0) { if (missingAllowed && errno == ENOENT) return {}; throw std::runtime_error("private_file_unavailable"); }
     struct stat st{};
     if (fstat(fd.fd, &st) || !S_ISREG(st.st_mode) || st.st_uid != owner || (st.st_mode & 077) ||
@@ -93,18 +112,212 @@ std::set<uid_t> hostUids(const std::string& module) {
     }
     return result;
 }
-bool desired(const std::string& file, uid_t appUid) {
+bool desired(const std::string& file, uid_t appUid, bool missingValue = false) {
     auto text = privateText(file, appUid, 4, true);
     while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.pop_back();
     if (text.empty()) {
         struct stat st{};
-        if (lstat(file.c_str(), &st) && errno == ENOENT) return false;
+        if (lstat(file.c_str(), &st) && errno == ENOENT) return missingValue;
         throw std::runtime_error("desired_config_invalid");
     }
     if (text == "0") return false;
     if (text == "1") return true;
     throw std::runtime_error("desired_config_invalid");
 }
+
+bool sameDirectory(const std::string& path, const struct stat& before) {
+    struct stat after{};
+    return !lstat(path.c_str(), &after) && S_ISDIR(after.st_mode) && after.st_uid == before.st_uid &&
+        after.st_dev == before.st_dev && after.st_ino == before.st_ino;
+}
+bool markerExists(const std::string& path) {
+    struct stat st{};
+    return !lstat(path.c_str(), &st) || errno != ENOENT;
+}
+bool sameMode(const std::string& app, const std::string& module, const struct stat& appStat,
+              const struct stat& moduleStat, bool policyMode) {
+    if (stopping || !sameDirectory(app, appStat) || !sameDirectory(module, moduleStat) ||
+        markerExists(module + "/disable") || markerExists(module + "/remove")) return false;
+    bool arbitration = false;
+    try { arbitration = desired(app + "/sf17fix-arbitration.conf", appStat.st_uid, true); }
+    catch (const std::exception&) { /* Preserve the supervisor's existing malformed-setting fallback. */ }
+    return arbitration == policyMode;
+}
+bool desiredChanged(const std::string& app, uid_t uid, bool wasReadable, bool screenshot, bool recording) {
+    try {
+        bool nextScreenshot = desired(app + "/sf17fix.conf", uid);
+        bool nextRecording = desired(app + "/sf17fix-recording.conf", uid);
+        return !wasReadable || nextScreenshot != screenshot || nextRecording != recording;
+    } catch (const std::exception&) {
+        return wasReadable;
+    }
+}
+
+int parseHealthInterval(std::string_view text) {
+    if (!text.empty() && text.back() == '\n') {
+        text.remove_suffix(1);
+        if (!text.empty() && text.back() == '\r') text.remove_suffix(1);
+    }
+    if (text.empty()) return kDefaultHealthIntervalSeconds;
+    int seconds = 0;
+    for (char c : text) {
+        if (c < '0' || c > '9') return kDefaultHealthIntervalSeconds;
+        seconds = seconds * 10 + (c - '0');
+        if (seconds > kMaxHealthIntervalSeconds) return kDefaultHealthIntervalSeconds;
+    }
+    return seconds;
+}
+
+int configuredHealthInterval(const std::string& app, uid_t uid) {
+    try { return parseHealthInterval(privateText(app + '/' + kHealthIntervalFile, uid, 16, true)); }
+    catch (const std::runtime_error&) { return kDefaultHealthIntervalSeconds; }
+}
+
+class HealthSchedule {
+    Clock::time_point earliest = Clock::time_point::min();
+    Clock::time_point next = Clock::now();
+    int seconds;
+public:
+    explicit HealthSchedule(int interval) : seconds(interval) {}
+    void request(Clock::time_point now) { next = std::min(next, std::max(earliest, now)); }
+    void configure(int interval, Clock::time_point now) {
+        if (seconds == interval) return;
+        seconds = interval;
+        // Cancel the old timer and verify once in response to the settings event.
+        next = std::max(earliest, now);
+    }
+    bool due(Clock::time_point now) const { return now >= next; }
+    void completed(Clock::time_point now) {
+        next = seconds ? now + std::chrono::seconds(seconds) : Clock::time_point::max();
+        earliest = now + kMinimumCheckGap;
+    }
+    Clock::time_point deadline() const { return next; }
+    std::string statusFields() const {
+        // This is a cached observation, not proof the worker is still alive.
+        const int ttl = seconds ? std::min(kStatusTtlMs, seconds * 1000 + 15000) : kStatusTtlMs;
+        return ",\"health_interval_seconds\":" + std::to_string(seconds) + ",\"status_ttl_ms\":" + std::to_string(ttl);
+    }
+};
+
+// Only these filenames affect runtime. Our own status writes never request a
+// second engine check. Keep periodic revalidation for lost/denied watches.
+class WakeSources {
+    Fd reader, writer, notify, target;
+    int appWatch = -1, moduleWatch = -1;
+    int targetPid = 0;
+    uint64_t targetStart = 0;
+    Clock::time_point nextFallback = Clock::now() + kFallbackInterval;
+    std::string refreshPath;
+    struct stat lastRefresh{};
+    bool refreshSeen = false;
+    static constexpr uint32_t mask = IN_CLOSE_WRITE | IN_MOVED_TO | IN_MOVED_FROM | IN_DELETE |
+        IN_CREATE | IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF | IN_ONLYDIR | IN_DONT_FOLLOW;
+public:
+    WakeSources(const std::string& app, const std::string& module) : refreshPath(app + "/sf17fix-refresh.request") {
+        int fds[2];
+        if (!pipe2(fds, O_CLOEXEC | O_NONBLOCK)) {
+            reader.reset(fds[0]); writer.reset(fds[1]); stopWakeFd = writer.fd;
+        }
+        notify.reset(inotify_init1(IN_CLOEXEC | IN_NONBLOCK));
+        if (notify.fd >= 0) {
+            appWatch = inotify_add_watch(notify.fd, app.c_str(), mask);
+            moduleWatch = inotify_add_watch(notify.fd, module.c_str(), mask);
+            if (appWatch < 0 && moduleWatch < 0) notify.reset();
+        }
+    }
+    ~WakeSources() { stopWakeFd = -1; }
+    bool reliable() const { return appWatch >= 0 && moduleWatch >= 0; }
+    bool fallbackDue(Clock::time_point now) {
+        if (reliable() || now < nextFallback) return false;
+        nextFallback = now + kFallbackInterval;
+        return true;
+    }
+    bool refreshChanged(uid_t uid) {
+        struct stat current{};
+        if (lstat(refreshPath.c_str(), &current) || !S_ISREG(current.st_mode) || current.st_uid != uid || (current.st_mode & 077)) {
+            refreshSeen = false;
+            return false;
+        }
+        bool changed = !refreshSeen || current.st_dev != lastRefresh.st_dev || current.st_ino != lastRefresh.st_ino ||
+            current.st_mtim.tv_sec != lastRefresh.st_mtim.tv_sec || current.st_mtim.tv_nsec != lastRefresh.st_mtim.tv_nsec;
+        refreshSeen = true;
+        lastRefresh = current;
+        return changed;
+    }
+    void follow(const EngineState& state) {
+        if (state.targetPid == targetPid && state.targetStart == targetStart) return;
+        target.reset();
+        targetPid = state.targetPid; targetStart = state.targetStart;
+#ifdef __NR_pidfd_open
+        if (targetPid <= 1 || !targetStart) return;
+        try {
+            if (processStart(targetPid) != targetStart) return;
+            Fd candidate(int(syscall(__NR_pidfd_open, targetPid, 0)));
+            if (candidate.fd < 0 || processStart(targetPid) != targetStart) return;
+            target.reset(candidate.fd); candidate.fd = -1;
+        } catch (const std::exception&) { /* Linux/SELinux fallback: bounded health timer. */ }
+#endif
+    }
+    size_t append(std::vector<pollfd>& fds) const {
+        size_t index = fds.size();
+        fds.push_back({reader.fd, POLLIN, 0});
+        fds.push_back({notify.fd, POLLIN, 0});
+        fds.push_back({target.fd, POLLIN, 0});
+        return index;
+    }
+    int timeout(Clock::time_point end) const {
+        if (!reliable()) end = std::min(end, nextFallback);
+        if (end == Clock::time_point::max()) return reader.fd >= 0 ? -1 : 1000;
+        // Round upward: repeated poll(0) in the final submillisecond would spin.
+        auto remaining = std::chrono::ceil<std::chrono::milliseconds>(end - Clock::now()).count();
+        return int(std::clamp<int64_t>(remaining, 0, reader.fd >= 0 ? INT32_MAX : 1000));
+    }
+    enum Event { Check = 1, Lifecycle = 2, Interval = 4 };
+    int consume(const std::vector<pollfd>& fds, size_t index) {
+        int events = 0;
+        if (fds[index + 2].revents) {
+            target.reset(); targetPid = 0; targetStart = 0;
+            events |= Check;
+        }
+        if (!fds[index + 1].revents) return events;
+        if (fds[index + 1].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            notify.reset(); appWatch = moduleWatch = -1;
+            return events | Check | Lifecycle | Interval;
+        }
+        // Bound event draining so an app cannot starve capture requests.
+        alignas(inotify_event) std::array<char, 8192> bytes{};
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            ssize_t count = read(notify.fd, bytes.data(), bytes.size());
+            if (count < 0 && errno != EAGAIN && errno != EINTR) {
+                notify.reset(); appWatch = moduleWatch = -1;
+                return events | Check | Lifecycle | Interval;
+            }
+            if (count <= 0) break;
+            for (size_t offset = 0; offset + sizeof(inotify_event) <= size_t(count); ) {
+                auto event = reinterpret_cast<const inotify_event*>(bytes.data() + offset);
+                size_t size = sizeof(inotify_event) + event->len;
+                if (size > size_t(count) - offset) throw std::runtime_error("configuration_watch_event_invalid");
+                offset += size;
+                if (event->mask & IN_Q_OVERFLOW) { events |= Check | Lifecycle | Interval; continue; }
+                if (event->mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED)) {
+                    if (event->wd == appWatch) appWatch = -1;
+                    if (event->wd == moduleWatch) moduleWatch = -1;
+                    events |= Check | Lifecycle | Interval;
+                }
+                if (!event->len) continue;
+                std::string_view name(event->name, strnlen(event->name, event->len));
+                if (event->wd == moduleWatch && (name == "disable" || name == "remove")) events |= Lifecycle;
+                if (event->wd == appWatch) {
+                    if (name == "sf17fix-arbitration.conf") events |= Lifecycle;
+                    if (name == kHealthIntervalFile) events |= Interval;
+                    if (name == "sf17fix.conf" || name == "sf17fix-recording.conf" || name == "sf17fix-refresh.request")
+                        events |= Check;
+                }
+            }
+        }
+        return events;
+    }
+};
 void publish(const std::string& directory, const std::string& name, const std::string& data, uid_t uid, gid_t gid, bool copyLabel) {
     Fd folder(open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
     struct stat folderStat{};
@@ -201,7 +414,9 @@ int serve(const std::string& appPath, const std::string& modulePath, const Engin
     Policy policy;
     EngineState screenshot, recording;
     bool wantScreenshot = false, wantRecording = false;
+    bool configReadable = false;
     bool publishFailed = false;
+    bool shuttingDown = false;
     std::string lastError;
     uint64_t nextConnection = 1;
     uint64_t engineChecks = 0, nativeMutations = 0, statusRequests = 0;
@@ -210,14 +425,16 @@ int serve(const std::string& appPath, const std::string& modulePath, const Engin
         if ((!app.starts_with("/data/user_de/") && !app.starts_with("/data/user/")) ||
             !app.ends_with("/net.hawyn.screenshotfreedoma17/files") || !module.starts_with("/data/adb/"))
             throw std::runtime_error("unexpected_broker_directory");
-        struct stat appStat{};
-        if (stat(app.c_str(), &appStat)) throw std::runtime_error("app_directory_unavailable");
+        struct stat appStat{}, moduleStat{};
+        if (stat(app.c_str(), &appStat) || stat(module.c_str(), &moduleStat)) throw std::runtime_error("broker_directory_unavailable");
         if (mkdir(kStateDirectory, 0700) && errno != EEXIST) throw std::runtime_error("state_directory_unavailable");
         canonicalDirectory(kStateDirectory, true);
         Fd lock(open((std::string(kStateDirectory) + "/native.lock").c_str(), O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0600));
         struct stat lockStat{};
         if (lock.fd < 0 || fstat(lock.fd, &lockStat) || !S_ISREG(lockStat.st_mode) || lockStat.st_uid || (lockStat.st_mode & 077) ||
             flock(lock.fd, LOCK_EX | LOCK_NB)) throw std::runtime_error("busy");
+        WakeSources wake(app, module);
+        HealthSchedule health(configuredHealthInterval(app, appStat.st_uid));
         auto runEngine = [&](bool record, bool enable) {
             ++engineChecks;
             auto state = engine(record, enable);
@@ -230,8 +447,9 @@ int serve(const std::string& appPath, const std::string& modulePath, const Engin
                 try {
                     wantScreenshot = desired(app + "/sf17fix.conf", appStat.st_uid);
                     wantRecording = desired(app + "/sf17fix-recording.conf", appStat.st_uid);
+                    configReadable = true;
                 } catch (const std::exception& error) {
-                    lastError = error.what(); policy.fault(); forceOriginal = true; configOk = false;
+                    configReadable = false; lastError = error.what(); policy.fault(); forceOriginal = true; configOk = false;
                 }
             }
             bool on = !forceOriginal && !policy.paused();
@@ -267,15 +485,25 @@ int serve(const std::string& appPath, const std::string& modulePath, const Engin
                 << ",\"screenshot_active\":" << (screenshot.active && screenshot.known ? "true" : "false")
                 << ",\"recording_active\":" << (recording.active && recording.known ? "true" : "false")
                 << ",\"coverage\":" << q(screenshot.unmanaged || recording.unmanaged ? "partial" : "full")
-                << ",\"matching\":false,\"phase\":" << q(policy.ready ? "running" : "inventory_wait")
+                << ",\"matching\":false,\"phase\":" << q(shuttingDown ? "stopped" : policy.ready ? "running" : "inventory_wait")
+                << ",\"control_events\":true" << health.statusFields()
                 << ",\"engine_checks\":" << engineChecks << ",\"native_mutations\":" << nativeMutations
                 << ",\"status_requests\":" << statusRequests;
             return out.str();
         };
         std::string epoch = "broker-epoch-" + std::to_string(getpid()) + '-' + std::to_string(processStart(getpid()));
         auto reply = [&](bool ok, const std::string& reason, const std::string& session = std::string()) {
-            return "{\"schema\":1,\"pipeline\":\"policy\",\"running\":true,\"ok\":" + std::string(ok ? "true" : "false") +
+            return "{\"schema\":1,\"pipeline\":\"policy\",\"running\":" + std::string(shuttingDown ? "false" : "true") +
+                ",\"ok\":" + (ok ? "true" : "false") +
                 ",\"reason\":" + q(reason) + ",\"epoch\":" + q(epoch) + ",\"session_id\":" + q(session) + fields() + '}';
+        };
+        // A READY client may wait for EOF instead of polling STATUS. Disconnect
+        // on every readiness fault, and release the generation for renegotiation.
+        auto closeFaultedController = [&] {
+            if (policy.ready || !policy.controller) return;
+            auto found = std::find_if(clients.begin(), clients.end(), [&](const auto& entry) { return entry.second.id == policy.controller; });
+            if (found != clients.end()) { close(found->first); clients.erase(found); }
+            policy.disconnect(policy.controller);
         };
         auto statuses = [&] {
             for (bool record : {false, true}) {
@@ -299,25 +527,43 @@ int serve(const std::string& appPath, const std::string& modulePath, const Engin
         if (bind(server.fd, reinterpret_cast<sockaddr*>(&address), socklen_t(offsetof(sockaddr_un, sun_path) + nameSize + 1)) ||
             listen(server.fd, 32)) throw std::runtime_error("socket_bind_failed");
         publish(module, "broker.pid", std::to_string(getpid()) + ' ' + std::to_string(processStart(getpid())), 0, 0, false);
-        auto nextRefresh = Clock::now();
         while (!stopping) {
-            if (Clock::now() >= nextRefresh) {
+            if (wake.fallbackDue(Clock::now())) {
+                if (!sameMode(app, module, appStat, moduleStat, true)) break;
+                health.configure(configuredHealthInterval(app, appStat.st_uid), Clock::now());
+                bool refresh = wake.refreshChanged(appStat.st_uid);
+                if (refresh || desiredChanged(app, appStat.st_uid, configReadable, wantScreenshot, wantRecording)) health.request(Clock::now());
+            }
+            if (health.due(Clock::now())) {
+                if (!sameMode(app, module, appStat, moduleStat, true)) break;
                 try {
-                    wantScreenshot = desired(app + "/sf17fix.conf", appStat.st_uid);
-                    wantRecording = desired(app + "/sf17fix-recording.conf", appStat.st_uid);
-                    apply(false); publishFailed = false; statuses();
+                    bool ok = apply(false); publishFailed = false;
+                    if (ok) lastError.clear();
+                    statuses();
                 } catch (const FatalTrace&) { throw;
                 } catch (const std::exception& error) {
                     lastError = error.what(); policy.fault(); apply(true); publishFailed = true;
                     try { statuses(); } catch (...) {}
                 }
-                nextRefresh = Clock::now() + std::chrono::seconds(3);
+                wake.follow(recording.targetPid > 0 ? recording : screenshot);
+                health.completed(Clock::now());
+                closeFaultedController();
             }
+            if (stopping) break;
             std::vector<pollfd> polls{{server.fd, POLLIN, 0}};
-            for (const auto& [fd, client] : clients) { (void)client; polls.push_back({fd, POLLIN, 0}); }
-            auto untilRefresh = std::chrono::duration_cast<std::chrono::milliseconds>(nextRefresh - Clock::now()).count();
-            int polled = poll(polls.data(), polls.size(), int(std::clamp<int64_t>(untilRefresh, 0, 1000)));
+            auto deadline = health.deadline();
+            for (const auto& [fd, client] : clients) {
+                polls.push_back({fd, POLLIN, 0});
+                if (!client.input.empty()) deadline = std::min(deadline, client.partialSince + std::chrono::seconds(2));
+            }
+            size_t watchIndex = wake.append(polls);
+            int polled = poll(polls.data(), polls.size(), wake.timeout(deadline));
             if (polled < 0) { if (errno == EINTR) continue; throw std::runtime_error("socket_poll_failed"); }
+            if (stopping) break;
+            int events = wake.consume(polls, watchIndex);
+            if ((events & WakeSources::Lifecycle) && !sameMode(app, module, appStat, moduleStat, true)) break;
+            if (events & WakeSources::Interval) health.configure(configuredHealthInterval(app, appStat.st_uid), Clock::now());
+            if (events & WakeSources::Check) health.request(Clock::now());
             if (polls[0].revents & POLLIN) {
                 int fd = accept4(server.fd, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
                 if (fd >= 0) {
@@ -334,7 +580,7 @@ int serve(const std::string& appPath, const std::string& modulePath, const Engin
             std::set<int> dropped;
             bool changed = false;
             bool disconnectChangedPolicy = false;
-            for (size_t i = 1; i < polls.size(); ++i) {
+            for (size_t i = 1; i < watchIndex; ++i) {
                 if (stopping) break;
                 int fd = polls[i].fd; auto found = clients.find(fd); if (found == clients.end()) continue;
                 auto& client = found->second;
@@ -385,7 +631,7 @@ int serve(const std::string& appPath, const std::string& modulePath, const Engin
                         }
                     }
                 }
-                if (client.input.size() > kMaxLine || (!client.input.empty() && Clock::now() - client.partialSince > std::chrono::seconds(2)) ||
+                if (client.input.size() > kMaxLine || (!client.input.empty() && Clock::now() - client.partialSince >= std::chrono::seconds(2)) ||
                     (polls[i].revents & (POLLERR | POLLHUP | POLLNVAL))) dropped.insert(fd);
             }
             for (int fd : dropped) {
@@ -398,9 +644,11 @@ int serve(const std::string& appPath, const std::string& modulePath, const Engin
                 // A read-only STATUS peer leaving changes no policy or native state.
                 if (disconnectChangedPolicy) apply(false);
                 try { statuses(); } catch (const std::exception& error) { lastError = error.what(); policy.fault(); apply(true); publishFailed = true; }
+                wake.follow(recording.targetPid > 0 ? recording : screenshot);
             }
+            closeFaultedController();
         }
-        policy.fault(); apply(true);
+        shuttingDown = true; policy.fault(); apply(true);
         try { statuses(); } catch (...) {}
         for (const auto& [fd, client] : clients) { (void)client; close(fd); }
         clients.clear();
@@ -428,16 +676,19 @@ int serveDirect(const std::string& appPath, const std::string& modulePath, const
         if ((!app.starts_with("/data/user_de/") && !app.starts_with("/data/user/")) ||
             !app.ends_with("/net.hawyn.screenshotfreedoma17/files") || !module.starts_with("/data/adb/"))
             throw std::runtime_error("unexpected_direct_directory");
-        struct stat appStat{};
-        if (stat(app.c_str(), &appStat)) throw std::runtime_error("app_directory_unavailable");
+        struct stat appStat{}, moduleStat{};
+        if (stat(app.c_str(), &appStat) || stat(module.c_str(), &moduleStat)) throw std::runtime_error("direct_directory_unavailable");
         if (mkdir(kStateDirectory, 0700) && errno != EEXIST) throw std::runtime_error("state_directory_unavailable");
         canonicalDirectory(kStateDirectory, true);
         Fd lock(open((std::string(kStateDirectory) + "/native.lock").c_str(), O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0600));
         struct stat lockStat{};
         if (lock.fd < 0 || fstat(lock.fd, &lockStat) || !S_ISREG(lockStat.st_mode) || lockStat.st_uid || (lockStat.st_mode & 077) ||
             flock(lock.fd, LOCK_EX | LOCK_NB)) throw std::runtime_error("busy");
+        WakeSources wake(app, module);
+        HealthSchedule health(configuredHealthInterval(app, appStat.st_uid));
         EngineState screenshot, recording;
         bool wantScreenshot = false, wantRecording = false;
+        bool configReadable = false;
         std::string error;
         uint64_t engineChecks = 0, nativeMutations = 0;
         auto runEngine = [&](bool record, bool enable) {
@@ -467,6 +718,7 @@ int serveDirect(const std::string& appPath, const std::string& modulePath, const
             bool ok = error.empty();
             std::string extra = ",\"matching\":false,\"phase\":\"direct\",\"policy_running\":false,"
                 "\"policy_ready\":false,\"policy_paused\":false,\"allow_all_tools\":true";
+            extra += health.statusFields();
             extra += ",\"engine_checks\":" + std::to_string(engineChecks) + ",\"native_mutations\":" + std::to_string(nativeMutations);
             for (bool record : {false, true}) {
                 const auto& state = record ? recording : screenshot;
@@ -479,52 +731,47 @@ int serveDirect(const std::string& appPath, const std::string& modulePath, const
             std::string text = std::string("{\"schema\":1,\"pipeline\":\"policy\",\"running\":false,\"ok\":") +
                 (ok ? "true" : "false") + ",\"matching\":false,\"phase\":\"direct\",\"ready\":false,"
                 "\"policy_ready\":false,\"paused\":false,\"policy_paused\":false,\"inventory_known\":false,"
-                "\"sessions\":0,\"blockers\":0,\"blocked_count\":0,\"allow_all_tools\":true,\"reason\":" +
+                "\"sessions\":0,\"blockers\":0,\"blocked_count\":0,\"allow_all_tools\":true" +
+                health.statusFields() + ",\"reason\":" +
                 q(error.empty() ? "arbitration_disabled" : error) + '}';
             publish(module, "policy-status.json", text, 0, 0, false);
             publish(app, "sf17fix-policy-status.json", text, appStat.st_uid, appStat.st_gid, true);
         };
         { MatchingProgress progress(app, module, appStat.st_uid, appStat.st_gid, false); if (!restore()) throw std::runtime_error("startup_restore_unverified"); }
         publish(module, "broker.pid", std::to_string(getpid()) + ' ' + std::to_string(processStart(getpid())), 0, 0, false);
-        Fd notify(inotify_init1(IN_CLOEXEC | IN_NONBLOCK));
-        if (notify.fd >= 0 && inotify_add_watch(notify.fd, app.c_str(), IN_CLOSE_WRITE | IN_MOVED_TO | IN_DELETE | IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF) < 0) {
-            close(notify.fd); notify.fd = -1;
-        }
-        auto nextHealth = Clock::now();
-        bool configurationChanged = true;
         while (!stopping) {
-            bool health = Clock::now() >= nextHealth;
-            if (configurationChanged || health || notify.fd < 0) {
-                bool beforeScreenshot = wantScreenshot, beforeRecording = wantRecording;
+            if (wake.fallbackDue(Clock::now())) {
+                if (!sameMode(app, module, appStat, moduleStat, false)) break;
+                health.configure(configuredHealthInterval(app, appStat.st_uid), Clock::now());
+                bool refresh = wake.refreshChanged(appStat.st_uid);
+                if (refresh || desiredChanged(app, appStat.st_uid, configReadable, wantScreenshot, wantRecording)) health.request(Clock::now());
+            }
+            if (health.due(Clock::now())) {
+                if (!sameMode(app, module, appStat, moduleStat, false)) break;
                 try {
+                    configReadable = false;
                     wantScreenshot = desired(app + "/sf17fix.conf", appStat.st_uid);
                     wantRecording = desired(app + "/sf17fix-recording.conf", appStat.st_uid);
-                    if (health || configurationChanged || beforeScreenshot != wantScreenshot || beforeRecording != wantRecording) {
-                        apply(); statuses(); nextHealth = Clock::now() + std::chrono::seconds(3);
-                    }
+                    configReadable = true;
+                    apply(); statuses();
                 } catch (const FatalTrace&) { throw;
                 } catch (const std::exception& e) {
                     error = e.what(); restore();
                     try { statuses(); } catch (...) {}
-                    nextHealth = Clock::now() + std::chrono::seconds(3);
                 }
-                configurationChanged = false;
+                wake.follow(recording.targetPid > 0 ? recording : screenshot);
+                health.completed(Clock::now());
             }
-            auto untilHealth = std::chrono::duration_cast<std::chrono::milliseconds>(nextHealth - Clock::now()).count();
-            pollfd descriptor{notify.fd, POLLIN, 0};
-            int result = poll(&descriptor, notify.fd >= 0 ? 1 : 0, int(std::clamp<int64_t>(untilHealth, 0, 1000)));
+            if (stopping) break;
+            std::vector<pollfd> polls;
+            size_t watchIndex = wake.append(polls);
+            int result = poll(polls.data(), polls.size(), wake.timeout(health.deadline()));
             if (result < 0) { if (errno == EINTR) continue; throw std::runtime_error("direct_poll_failed"); }
-            if (notify.fd >= 0 && descriptor.revents & POLLIN) {
-                alignas(inotify_event) std::array<char, 4096> events{};
-                ssize_t count = read(notify.fd, events.data(), events.size());
-                for (size_t offset = 0; count > 0 && offset + sizeof(inotify_event) <= size_t(count); ) {
-                    auto event = reinterpret_cast<const inotify_event*>(events.data() + offset);
-                    if (offset + sizeof(inotify_event) + event->len > size_t(count)) throw std::runtime_error("direct_watch_event_invalid");
-                    if (event->mask & (IN_Q_OVERFLOW | IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED)) configurationChanged = true;
-                    if (event->len && (std::string(event->name) == "sf17fix.conf" || std::string(event->name) == "sf17fix-recording.conf")) configurationChanged = true;
-                    offset += sizeof(inotify_event) + event->len;
-                }
-            }
+            if (stopping) break;
+            int events = wake.consume(polls, watchIndex);
+            if ((events & WakeSources::Lifecycle) && !sameMode(app, module, appStat, moduleStat, false)) break;
+            if (events & WakeSources::Interval) health.configure(configuredHealthInterval(app, appStat.st_uid), Clock::now());
+            if (events & WakeSources::Check) health.request(Clock::now());
         }
         bool restored = restore();
         try { statuses(); } catch (...) {}

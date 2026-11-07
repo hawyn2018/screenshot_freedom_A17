@@ -8,9 +8,13 @@ import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.SystemClock;
+import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
+import android.system.StructStat;
 import android.util.Log;
 
 import org.json.JSONObject;
@@ -20,6 +24,7 @@ import java.io.FileInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.HashSet;
@@ -30,6 +35,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 import io.github.libxposed.service.XposedService;
 import io.github.libxposed.service.XposedServiceHelper;
@@ -58,11 +64,19 @@ public final class CompatController {
     private static final String KEY_TOOL_DEFAULTS_READY = "capture_tool_defaults_v1";
     private static final String KEY_TOOL_MECHANISMS_READY = "capture_tool_mechanisms_v1";
     private static final String KEY_TOOL_MECHANISM_REVIEW = "capture_tool_mechanism_review_v1";
-    private static final long REQUIRED_SYSTEM_VERSION = 26;
+    private static final long REQUIRED_SYSTEM_VERSION = 44;
     private static final String MODULE_DIR = "/data/adb/modules/enable_screenshot17fix";
     private static final String TAG = "ScreenshotCompatUI";
     public static final String ARBITRATION_NOT_RUNNING = "系统采集仲裁未运行，将允许所有采集工具";
     public static final String COMPATIBILITY_MATCHING = "正在匹配兼容，请稍后";
+    public static final int DEFAULT_HEALTH_INTERVAL_SECONDS = 0;
+    public static final int MAX_HEALTH_INTERVAL_SECONDS = 86_400;
+    private static final String HEALTH_OPTIONS = "sf17fix_native_options";
+    private static final String HEALTH_INTERVAL_KEY = "health_interval_seconds";
+    private static final String HEALTH_INTERVAL_FILE = "sf17fix-health-interval.conf";
+    private static final String HEALTH_SNAPSHOT_STALE = "等待系统模块更新状态";
+    private static final long STALE_HEALTH_RETRY_MS = 30_000;
+    private static final long HEALTH_RESPONSE_WAIT_MS = 10_000;
     private static final ExecutorService WORKER = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "ScreenshotCompat-config");
         t.setDaemon(true);
@@ -77,6 +91,7 @@ public final class CompatController {
     });
     private static final AtomicBoolean REGISTERED = new AtomicBoolean();
     private static final AtomicBoolean REFRESH_PENDING = new AtomicBoolean();
+    private static final AtomicBoolean NATIVE_REFRESH_PENDING = new AtomicBoolean();
     private static final AtomicBoolean FRAMEWORK_REFRESH_PENDING = new AtomicBoolean();
     private static final AtomicBoolean UPGRADE_RELOAD_REQUESTED = new AtomicBoolean();
     private static final AtomicBoolean INSTALL_PENDING = new AtomicBoolean();
@@ -86,6 +101,8 @@ public final class CompatController {
     private static volatile SharedPreferences local;
     private static volatile SharedPreferences whiteTools;
     private static volatile SharedPreferences blackTools;
+    private static SharedPreferences healthOptions;
+    private static volatile int healthIntervalSeconds = DEFAULT_HEALTH_INTERVAL_SECONDS;
     private static volatile String frameworkStatus = "等待 LSPosed 连接";
     private static volatile String nativeDetails = "等待系统组件状态";
     private static volatile String recordingNativeDetails = "等待录屏输出状态";
@@ -110,10 +127,14 @@ public final class CompatController {
     private static volatile boolean recordingNativeOperationOk;
     private static volatile boolean recordingNativeSupported;
     private static volatile boolean recordingNativeCapabilityMissing;
+    private static volatile boolean nativeHealthSnapshotStale;
+    private static volatile boolean recordingHealthSnapshotStale;
+    private static volatile boolean policyHealthSnapshotStale;
     private static volatile boolean frameworkLoaded;
     private static volatile boolean configurationSynced;
     private static volatile String lastTargets = "";
     private static volatile long lastFrameworkStatusQuery = -15_000;
+    private static volatile long lastNativeRefreshRequest = -STALE_HEALTH_RETRY_MS;
     private static final StatusFile NATIVE_STATUS_FILE = new StatusFile();
     private static final StatusFile RECORDING_STATUS_FILE = new StatusFile();
     private static final StatusFile POLICY_STATUS_FILE = new StatusFile();
@@ -128,6 +149,8 @@ public final class CompatController {
                 local = context.getSharedPreferences(PREF_GROUP, Context.MODE_PRIVATE);
                 whiteTools = context.getSharedPreferences(WHITE_TOOL_GROUP, Context.MODE_PRIVATE);
                 blackTools = context.getSharedPreferences(BLACK_TOOL_GROUP, Context.MODE_PRIVATE);
+                healthOptions = context.getSharedPreferences(HEALTH_OPTIONS, Context.MODE_PRIVATE);
+                healthIntervalSeconds = readSavedHealthInterval();
                 // Seed only a missing preference. Existing initialized app data
                 // retains the previous implicit ON default; a fresh install is OFF.
                 if (!local.contains(KEY_ARBITRATION_ENABLED)) {
@@ -139,6 +162,7 @@ public final class CompatController {
                 WORKER.execute(() -> {
                     // Device-protected settings survive reboot. Publish them before
                     // first-run package discovery, which may wait for PackageManager.
+                    try { writeHealthIntervalConfig(healthIntervalSeconds); } catch (Exception e) { report(e); }
                     try { writeArbitrationConfig(); writeNativeConfig(); writeRecordingNativeConfig(); } catch (Exception e) { report(e); }
                     requestStatusRefresh();
                     initializeCaptureTools();
@@ -170,12 +194,58 @@ public final class CompatController {
                 }
             });
         }
-        refreshAsync();
     }
 
     public boolean getSecureEnabled() { return local.getBoolean(KEY_SECURE, true); }
     public boolean getSkipEnabled() { return local.getBoolean(KEY_SKIP, true); }
     public boolean getArbitrationEnabled() { return local.getBoolean(KEY_ARBITRATION_ENABLED, DEFAULT_ARBITRATION_ENABLED); }
+
+    public int getHealthIntervalSeconds() { return healthIntervalSeconds; }
+
+    /** The callback reports local persistence on the main thread, not a daemon acknowledgement. */
+    public void setHealthIntervalSeconds(int seconds, Consumer<Boolean> callback) {
+        if (!validHealthInterval(seconds)) {
+            completeHealthSave(callback, false);
+            return;
+        }
+        WORKER.execute(() -> {
+            boolean saved = false;
+            boolean preferencesAttempted = false;
+            int previous = healthIntervalSeconds;
+            try {
+                writeHealthIntervalConfig(seconds);
+                if (seconds != previous) {
+                    preferencesAttempted = true;
+                    if (!healthOptions.edit().putInt(HEALTH_INTERVAL_KEY, seconds).commit()) {
+                        throw new IOException("原生检查间隔偏好写入失败");
+                    }
+                }
+                healthIntervalSeconds = seconds;
+                operationStatus = "";
+                saved = true;
+            } catch (Exception failure) {
+                if (preferencesAttempted) {
+                    // SharedPreferences.commit() can change its in-memory value even on
+                    // failure. Restore both representations before reporting the failure.
+                    try {
+                        if (!healthOptions.edit().putInt(HEALTH_INTERVAL_KEY, previous).commit()) {
+                            throw new IOException("原生检查间隔偏好回滚失败");
+                        }
+                    } catch (Exception error) { failure.addSuppressed(error); }
+                    try { writeHealthIntervalConfig(previous); }
+                    catch (Exception error) { failure.addSuppressed(error); }
+                }
+                report(failure);
+            } finally {
+                requestStatusRefresh();
+                completeHealthSave(callback, saved);
+            }
+        });
+    }
+
+    private static void completeHealthSave(Consumer<Boolean> callback, boolean saved) {
+        if (callback != null) new Handler(Looper.getMainLooper()).post(() -> callback.accept(saved));
+    }
     public boolean getRecordingSecureEnabled() { return getSecureEnabled(); }
     public boolean getRecordingSkipEnabled() { return getSkipEnabled(); }
     public Set<String> getCaptureToolPackages() {
@@ -228,6 +298,10 @@ public final class CompatController {
     public boolean isNativeMatching() { return nativeMatching; }
     public boolean isNativeKnown() { return nativeKnown; }
     public boolean isNativeOperationOk() { return nativeOperationOk; }
+    public boolean isNativeHealthSnapshotStale() {
+        return nativeHealthSnapshotStale || recordingHealthSnapshotStale
+                || (getArbitrationEnabled() && policyHealthSnapshotStale);
+    }
     public boolean isConfigurationSynced() { return configurationSynced; }
     public boolean isRecordingNativeActive() { return recordingNativeActive; }
     public boolean isRecordingNativeMatching() { return recordingNativeMatching; }
@@ -250,6 +324,8 @@ public final class CompatController {
                     .put("configuration_synced", configurationSynced).put("framework_status", frameworkStatus)
                     .put("framework_targets", lastTargets).put("upgrade_reload", upgradeReloadDetails)
                     .put("operation_status", operationStatus)
+                    .put("health_interval_seconds", healthIntervalSeconds)
+                    .put("health_snapshot_stale", isNativeHealthSnapshotStale())
                     .put("secure_enabled", getSecureEnabled()).put("skip_enabled", getSkipEnabled())
                     .put("arbitration_enabled", getArbitrationEnabled()).put("tool_mode", getCaptureToolMode())
                     .put("native_active", nativeActive).put("native_known", nativeKnown)
@@ -270,6 +346,7 @@ public final class CompatController {
         }
     }
     public String getPolicyDetails() { return isPolicyMatching() ? COMPATIBILITY_MATCHING
+            : getArbitrationEnabled() && policyHealthSnapshotStale ? HEALTH_SNAPSHOT_STALE
             : isPolicyRunning() ? policyDetails : ARBITRATION_NOT_RUNNING; }
     public boolean isPolicyRunning() { return getArbitrationEnabled() && policyRunning; }
     public boolean isPolicyMatching() { return getArbitrationEnabled()
@@ -281,6 +358,7 @@ public final class CompatController {
     public String getStatus() {
         if (!operationStatus.isEmpty()) return operationStatus;
         if (isPolicyMatching()) return COMPATIBILITY_MATCHING;
+        if (isNativeHealthSnapshotStale()) return HEALTH_SNAPSHOT_STALE;
         if (!isPolicyRunning()) return ARBITRATION_NOT_RUNNING;
         if ((getSecureEnabled() || getRecordingSecureEnabled()) && !frameworkLoaded)
             return "窗口兼容等待系统模块加载";
@@ -404,6 +482,7 @@ public final class CompatController {
 
     public void applyAsync() {
         WORKER.execute(() -> {
+            try { writeHealthIntervalConfig(healthIntervalSeconds); } catch (Exception e) { report(e); }
             try { writeNativeConfig(); writeRecordingNativeConfig(); writeArbitrationConfig(); } catch (Exception e) { report(e); }
             syncRemote();
             updateFrameworkStatus();
@@ -412,8 +491,51 @@ public final class CompatController {
     }
 
     public void refreshAsync() {
+        requestNativeRefresh(false);
         requestStatusRefresh();
         requestFrameworkRefresh(true);
+    }
+
+    /** Only an expired snapshot on the visible home page may wake the broker automatically. */
+    public void refreshStaleNativeHealthAsync() {
+        if (isNativeHealthSnapshotStale()
+                && SystemClock.elapsedRealtime() - lastNativeRefreshRequest >= STALE_HEALTH_RETRY_MS) {
+            requestNativeRefresh(true);
+        }
+    }
+
+    public boolean isAwaitingNativeHealthRefresh() {
+        return NATIVE_REFRESH_PENDING.get()
+                || SystemClock.elapsedRealtime() - lastNativeRefreshRequest < HEALTH_RESPONSE_WAIT_MS;
+    }
+
+    /** Send a one-shot request without changing the native timer configuration. */
+    private void requestNativeRefresh(boolean staleOnly) {
+        if (!NATIVE_REFRESH_PENDING.compareAndSet(false, true)) return;
+        STATUS_WORKER.execute(() -> {
+            File temporary = null;
+            try {
+                long now = SystemClock.elapsedRealtime();
+                if (now - lastNativeRefreshRequest < (staleOnly ? STALE_HEALTH_RETRY_MS : 1500)) return;
+                if (staleOnly && !isNativeHealthSnapshotStale()) return;
+                lastNativeRefreshRequest = now;
+                File directory = context.getFilesDir();
+                temporary = File.createTempFile(".sf17fix-refresh-", ".tmp", directory);
+                Os.chmod(temporary.getAbsolutePath(), 0600);
+                try (FileOutputStream output = new FileOutputStream(temporary)) {
+                    output.write('1');
+                    output.write('\n');
+                }
+                // An event marker, not durable state. Rename makes the signal
+                // atomic without a needless sync to storage on every resume.
+                Os.rename(temporary.getAbsolutePath(), new File(directory, "sf17fix-refresh.request").getAbsolutePath());
+            } catch (Exception error) {
+                Diagnostics.recordError(context, "native.refresh.request", error);
+            } finally {
+                if (temporary != null) temporary.delete();
+                NATIVE_REFRESH_PENDING.set(false);
+            }
+        });
     }
 
     /** Foreground polling is coalesced; full framework enumeration has its own cadence. */
@@ -442,6 +564,7 @@ public final class CompatController {
     }
 
     private static void requestFrameworkRefresh(boolean force) {
+        if (framework == null) return; // Service arrival is an event, not a polling target.
         long now = SystemClock.elapsedRealtime();
         long interval = frameworkLoaded && configurationSynced ? 15_000 : 5_000;
         if (!force && now - lastFrameworkStatusQuery < interval) return;
@@ -520,9 +643,9 @@ public final class CompatController {
             String name = service.getFrameworkName();
             frameworkLoaded = false;
             boolean previousVersion = false;
-            StringBuilder targets = new StringBuilder();
+            StringBuilder targets = Diagnostics.isEnabled(context) ? new StringBuilder() : null;
             for (var target : service.getRunningTargets()) {
-                targets.append(target.getProcessName()).append('/').append(target.getPid())
+                if (targets != null) targets.append(target.getProcessName()).append('/').append(target.getPid())
                         .append(" uid=").append(target.getUid())
                         .append(" version=").append(target.getLoadedVersionCode())
                         .append(" state=").append(target.getState()).append(';');
@@ -534,11 +657,14 @@ public final class CompatController {
                     previousVersion = !frameworkLoaded;
                 }
             }
-            String details = targets.toString();
-            if (!details.equals(lastTargets)) {
-                lastTargets = details;
-                Log.i(TAG, "Framework targets: " + details);
-                Diagnostics.recordState(context, "framework.targets", details);
+            if (targets != null) {
+                String details = targets.toString();
+                if (!details.equals(lastTargets)) {
+                    lastTargets = details;
+                    Diagnostics.recordState(context, "framework.targets", details);
+                }
+            } else {
+                lastTargets = "";
             }
             frameworkStatus = name + (frameworkLoaded ? " · 系统模块已加载"
                     : previousVersion ? " · 系统仍运行旧版，请重新加载模块或重启"
@@ -752,6 +878,54 @@ public final class CompatController {
         writeBooleanConfig("sf17fix-arbitration.conf", local.getBoolean(KEY_ARBITRATION_ENABLED, DEFAULT_ARBITRATION_ENABLED));
     }
 
+    private static boolean validHealthInterval(long seconds) {
+        return seconds >= 0 && seconds <= MAX_HEALTH_INTERVAL_SECONDS;
+    }
+
+    private static int readSavedHealthInterval() {
+        try {
+            // Older builds published the implicit 60-second default to the private file.
+            if (!healthOptions.contains(HEALTH_INTERVAL_KEY)
+                    && matchesPrivateHealthConfig(new File(context.getFilesDir(), HEALTH_INTERVAL_FILE),
+                            "60\n".getBytes(StandardCharsets.US_ASCII))) return 60;
+            int saved = healthOptions.getInt(HEALTH_INTERVAL_KEY, DEFAULT_HEALTH_INTERVAL_SECONDS);
+            return validHealthInterval(saved) ? saved : DEFAULT_HEALTH_INTERVAL_SECONDS;
+        } catch (ClassCastException error) {
+            return DEFAULT_HEALTH_INTERVAL_SECONDS;
+        }
+    }
+
+    private static void writeHealthIntervalConfig(int seconds) throws Exception {
+        if (!validHealthInterval(seconds)) throw new IllegalArgumentException("原生检查间隔超出范围");
+        File directory = context.getFilesDir();
+        File destination = new File(directory, HEALTH_INTERVAL_FILE);
+        byte[] expected = (Integer.toString(seconds) + "\n").getBytes(StandardCharsets.US_ASCII);
+        if (matchesPrivateHealthConfig(destination, expected)) return;
+        File temporary = File.createTempFile(".sf17fix-health-", ".tmp", directory);
+        try {
+            Os.chmod(temporary.getAbsolutePath(), 0600);
+            try (FileOutputStream output = new FileOutputStream(temporary)) {
+                output.write(expected);
+                output.getFD().sync();
+            }
+            Os.rename(temporary.getAbsolutePath(), destination.getAbsolutePath());
+        } finally { temporary.delete(); }
+    }
+
+    private static boolean matchesPrivateHealthConfig(File file, byte[] expected) {
+        try {
+            StructStat named = Os.lstat(file.getAbsolutePath());
+            if (!OsConstants.S_ISREG(named.st_mode) || (named.st_mode & 077) != 0
+                    || named.st_uid != android.os.Process.myUid() || named.st_size != expected.length) return false;
+            try (FileInputStream input = new FileInputStream(file)) {
+                StructStat opened = Os.fstat(input.getFD());
+                if (named.st_dev != opened.st_dev || named.st_ino != opened.st_ino) return false;
+                for (byte digit : expected) if (input.read() != digit) return false;
+                return input.read() == -1;
+            }
+        } catch (Exception ignored) { return false; }
+    }
+
     private static void writeBooleanConfig(String name, boolean enabled) throws Exception {
         File destination = new File(context.getFilesDir(), name);
         int digit = enabled ? '1' : '0';
@@ -776,17 +950,20 @@ public final class CompatController {
         File file = new File(context.getFilesDir(), "sf17fix-status.json");
         nativeCapabilityMissing = false;
         nativeMatching = false;
+        nativeHealthSnapshotStale = false;
         try {
-            if (!file.isFile()) {
+            StatusSnapshot snapshot = NATIVE_STATUS_FILE.read(file);
+            if (snapshot == null) {
                 nativeActive = false;
                 nativeKnown = false;
                 nativeOperationOk = false;
                 nativeDetails = "系统组件尚未安装，或尚未启动";
                 return;
             }
-            long age = System.currentTimeMillis() - file.lastModified();
-            JSONObject status = NATIVE_STATUS_FILE.read(file);
-            boolean fresh = age >= -5_000 && age < 15_000;
+            long age = snapshot.age();
+            JSONObject status = snapshot.status;
+            boolean fresh = statusFresh(status, "screenshot", age, 15_000);
+            nativeHealthSnapshotStale = !fresh && isHealthSnapshot(status, "screenshot");
             nativeMatching = statusMatching(status, "screenshot", age, 15_000);
             nativeCapabilityMissing = fresh && capabilityMissing(status);
             // A failed disable can leave an observed active patch in place. Keep
@@ -794,7 +971,8 @@ public final class CompatController {
             nativeKnown = fresh && status.optBoolean("active_known");
             nativeActive = nativeKnown && status.optBoolean("active");
             nativeOperationOk = fresh && !nativeMatching && status.optBoolean("ok");
-            if (!fresh) nativeDetails = "系统组件状态已过期，请安装或更新系统组件";
+            if (nativeHealthSnapshotStale) nativeDetails = HEALTH_SNAPSHOT_STALE;
+            else if (!fresh) nativeDetails = "系统组件状态已过期，请安装或更新系统组件";
             else if (nativeMatching) nativeDetails = COMPATIBILITY_MATCHING;
             else if (nativeCapabilityMissing) nativeDetails = capabilityMessage("截图", status);
             else if (!status.optBoolean("supported")) nativeDetails = "截图原生接口待核对：" + status.optString("reason");
@@ -816,8 +994,10 @@ public final class CompatController {
         File file = new File(context.getFilesDir(), "sf17fix-recording-status.json");
         recordingNativeCapabilityMissing = false;
         recordingNativeMatching = false;
+        recordingHealthSnapshotStale = false;
         try {
-            if (!file.isFile()) {
+            StatusSnapshot snapshot = RECORDING_STATUS_FILE.read(file);
+            if (snapshot == null) {
                 recordingNativeActive = false;
                 recordingNativeKnown = false;
                 recordingNativeOperationOk = false;
@@ -826,9 +1006,10 @@ public final class CompatController {
                 recordingNativeDetails = "录屏系统组件状态尚未就绪，请安装或更新系统组件";
                 return;
             }
-            long age = System.currentTimeMillis() - file.lastModified();
-            JSONObject status = RECORDING_STATUS_FILE.read(file);
-            boolean fresh = age >= -5_000 && age < 15_000;
+            long age = snapshot.age();
+            JSONObject status = snapshot.status;
+            boolean fresh = statusFresh(status, "recording", age, 15_000);
+            recordingHealthSnapshotStale = !fresh && isHealthSnapshot(status, "recording");
             boolean schemaKnown = status.optInt("schema", -1) == 1;
             recordingPipeline = schemaKnown ? status.optString("pipeline", "") : "";
             boolean pipelineKnown = "recording".equals(recordingPipeline);
@@ -838,7 +1019,8 @@ public final class CompatController {
             recordingNativeActive = recordingNativeKnown && status.optBoolean("active");
             recordingNativeOperationOk = fresh && schemaKnown && pipelineKnown && !recordingNativeMatching && status.optBoolean("ok");
             recordingNativeSupported = fresh && schemaKnown && pipelineKnown && status.optBoolean("supported");
-            if (!fresh) recordingNativeDetails = "录屏系统组件状态已过期，请安装或更新系统组件";
+            if (recordingHealthSnapshotStale) recordingNativeDetails = HEALTH_SNAPSHOT_STALE;
+            else if (!fresh) recordingNativeDetails = "录屏系统组件状态已过期，请安装或更新系统组件";
             else if (!schemaKnown) recordingNativeDetails = "录屏状态格式待更新，请安装新版系统组件";
             else if (!pipelineKnown) recordingNativeDetails = "录屏状态通道不匹配，请更新系统组件";
             else if (recordingNativeMatching) recordingNativeDetails = COMPATIBILITY_MATCHING;
@@ -887,12 +1069,18 @@ public final class CompatController {
         policyPaused = false;
         policyBlockers = -1;
         policyDetails = ARBITRATION_NOT_RUNNING;
+        policyHealthSnapshotStale = false;
         if (!local.getBoolean(KEY_ARBITRATION_ENABLED, DEFAULT_ARBITRATION_ENABLED)) return;
         try {
-            if (!file.isFile()) return;
-            long age = System.currentTimeMillis() - file.lastModified();
-            if (age < -5_000 || age >= 8_000) return;
-            JSONObject status = POLICY_STATUS_FILE.read(file);
+            StatusSnapshot snapshot = POLICY_STATUS_FILE.read(file);
+            if (snapshot == null) return;
+            long age = snapshot.age();
+            JSONObject status = snapshot.status;
+            if (!statusFresh(status, "policy", age, 8_000)) {
+                policyHealthSnapshotStale = isHealthSnapshot(status, "policy");
+                if (policyHealthSnapshotStale) policyDetails = HEALTH_SNAPSHOT_STALE;
+                return;
+            }
             policyMatching = statusMatching(status, "policy", age, 8_000);
             if (policyMatching) {
                 policyRunning = Boolean.TRUE.equals(status.opt("running"));
@@ -938,7 +1126,7 @@ public final class CompatController {
         try {
             for (String key : new String[]{"schema", "pipeline", "ok", "supported", "active", "active_known",
                     "owned", "matching", "reason", "detail", "errno", "pid", "build_id", "site_offset",
-                    "running", "ready", "paused", "coverage", "file_access"}) {
+                    "running", "ready", "paused", "coverage", "file_access", "health_interval_seconds", "status_ttl_ms"}) {
                 if (status.has(key)) detail.put(key, status.opt(key));
             }
         } catch (Exception ignored) { /* The complete source status is also included by the exporter. */ }
@@ -946,7 +1134,7 @@ public final class CompatController {
     }
 
     private static boolean policyStatusRunning(JSONObject status, long age) throws Exception {
-        return age >= -5_000 && age < 8_000
+        return statusFresh(status, "policy", age, 8_000)
                 && status.get("schema") instanceof Integer schema && schema == 1
                 && "policy".equals(status.get("pipeline"))
                 && Boolean.TRUE.equals(status.get("running"));
@@ -959,26 +1147,78 @@ public final class CompatController {
                 && Boolean.TRUE.equals(status.opt("matching"));
     }
 
+    private static boolean statusFresh(JSONObject status, String pipeline, long age, long legacyMaximumAge) {
+        long maximumAge = legacyMaximumAge;
+        Object ttl = status.opt("status_ttl_ms");
+        if (!Boolean.TRUE.equals(status.opt("matching"))
+                && status.opt("schema") instanceof Integer schema && schema == 1
+                && pipeline.equals(status.opt("pipeline"))
+                && (ttl instanceof Integer || ttl instanceof Long)) {
+            long requested = ((Number) ttl).longValue();
+            if (requested >= legacyMaximumAge && requested <= 120_000) maximumAge = requested;
+        }
+        return age >= -5_000 && age < maximumAge;
+    }
+
+    private static boolean isHealthSnapshot(JSONObject status, String pipeline) {
+        Object value = status.opt("health_interval_seconds");
+        return !Boolean.TRUE.equals(status.opt("matching"))
+                && status.opt("schema") instanceof Integer schema && schema == 1
+                && pipeline.equals(status.opt("pipeline"))
+                && (value instanceof Integer || value instanceof Long)
+                && validHealthInterval(((Number) value).longValue());
+    }
+
+    private static final class StatusSnapshot {
+        final JSONObject status;
+        final long modifiedMillis;
+        StatusSnapshot(JSONObject status, long modifiedMillis) {
+            this.status = status;
+            this.modifiedMillis = modifiedMillis;
+        }
+        long age() { return System.currentTimeMillis() - modifiedMillis; }
+    }
+
     /** Cache immutable parsed snapshots, while freshness is checked on every poll. */
     private static final class StatusFile {
-        private long modified = Long.MIN_VALUE;
-        private long length = -1;
-        private long inode = -1;
+        private StructStat identity;
         private String text;
-        private JSONObject parsed;
+        private StatusSnapshot snapshot;
 
-        synchronized JSONObject read(File file) throws Exception {
-            long currentModified = file.lastModified(), currentLength = file.length();
-            long currentInode = Os.stat(file.getAbsolutePath()).st_ino;
-            if (parsed != null && currentModified == modified && currentLength == length && currentInode == inode) return parsed;
-            String next;
-            try (InputStream input = new FileInputStream(file)) { next = readText(input, 65_536); }
-            if (parsed == null || !next.equals(text)) parsed = new JSONObject(next);
-            text = next;
-            modified = currentModified;
-            length = currentLength;
-            inode = currentInode;
-            return parsed;
+        synchronized StatusSnapshot read(File file) throws Exception {
+            try {
+                StructStat observed = Os.stat(file.getAbsolutePath());
+                if (!OsConstants.S_ISREG(observed.st_mode)) return absent();
+                if (identity != null && observed.st_dev == identity.st_dev && observed.st_ino == identity.st_ino
+                        && observed.st_size == identity.st_size && modified(observed) == modified(identity)) return snapshot;
+                // The publisher atomically replaces the file. Pair the bytes
+                // with the opened inode even if a replacement races stat/open.
+                try (FileInputStream input = new FileInputStream(file)) {
+                    StructStat opened = Os.fstat(input.getFD());
+                    if (!OsConstants.S_ISREG(opened.st_mode)) return absent();
+                    String next = readText(input, 65_536);
+                    JSONObject parsed = snapshot != null && next.equals(text) ? snapshot.status : new JSONObject(next);
+                    snapshot = new StatusSnapshot(parsed, modified(opened));
+                    identity = opened;
+                    text = next;
+                    return snapshot;
+                }
+            } catch (ErrnoException error) {
+                if (error.errno == OsConstants.ENOENT) return absent();
+                throw error;
+            }
+        }
+
+        private StatusSnapshot absent() {
+            identity = null;
+            text = null;
+            snapshot = null;
+            return null;
+        }
+
+        private static long modified(StructStat stat) {
+            return stat.st_mtime * 1000 + (Build.VERSION.SDK_INT >= 27 && stat.st_mtim != null
+                    ? stat.st_mtim.tv_nsec / 1_000_000 : 0);
         }
     }
 
@@ -1025,6 +1265,7 @@ public final class CompatController {
                 writeNativeConfig();
                 writeRecordingNativeConfig();
                 writeArbitrationConfig();
+                writeHealthIntervalConfig(healthIntervalSeconds);
                 String mod = quote(MODULE_DIR), src = quote(stage.getAbsolutePath());
                 String script = "set -eu\nMOD=" + mod + "\nSRC=" + src + "\nDIAGNOSTIC=" + (diagnostic ? "1" : "0") + "\n"
                         + "echo 'SF17FIX_INSTALL_BEGIN'\n"

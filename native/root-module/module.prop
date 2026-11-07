@@ -1,6 +1,6 @@
 id=enable_screenshot17fix
 name=自由截图A17
-version=3.5.9
-versionCode=43
+version=3.6.1
+versionCode=45
 author=Hawyn; Codex
-description=截图与录屏按采集工具名单仲裁。自动匹配可信系统映射读取方式并缓存，复用时重新校验；关闭、异常退出或卸载时还原自有补丁。
+description=截图、录屏与系统镜像兼容。原生定时检查间隔可调，配置和进程变化仍可触发检查；关闭、异常退出或卸载时还原自有补丁。

@@ -10,10 +10,10 @@ import sys
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '3.5.9'
-VERSION_CODE = 43
+VERSION = '3.6.7'
+VERSION_CODE = 51
 # Capture compatibility uses the independently controlled native companion.
-ROOT_COMPONENT_VERSION = '3.5.9'
+ROOT_COMPONENT_VERSION = '3.6.1'
 UI_BASELINE_VERSION = '3.5.6'
 APP_BASELINE_VERSION = '3.5.6'
 ARTIFACT_NAME = 'ScreenshotFreedomA17'
@@ -74,27 +74,20 @@ def package_root_component():
 
 
 def verify_compatibility_update_scope():
-    """Seal unrelated behavior while allowing the 3.5.9 native access and logging fix."""
+    """Verify the app update keeps native and framework capture code intact."""
     import json
-    baseline = ROOT / 'releases/3.5.8_debug'
-    source = baseline / f'{ARTIFACT_NAME}-3.5.8_debug-source.zip'
-    # Public snapshots omit private developer release archives. Only skip the
-    # historical source comparison when BOTH inputs are genuinely absent.
+    baseline_version = '3.6.6'
+    baseline = ROOT / 'releases' / baseline_version
+    source = baseline / f'{ARTIFACT_NAME}-{baseline_version}-source.zip'
     record_path = baseline / 'release-record.json'
     if not any(path.exists() or path.is_symlink() for path in (source, record_path)):
         print('PUBLIC_BUILD: historical source baseline absent; full native/APK build continues')
         return
-    record = json.loads((baseline / 'release-record.json').read_text(encoding='utf-8'))
+    record = json.loads(record_path.read_text(encoding='utf-8'))
     if hashlib.sha256(source.read_bytes()).hexdigest() != record['artifacts'][source.name]:
-        raise RuntimeError('Diagnostic baseline source differs from its sealed release')
-    allowed = {
-        'app/src/main/java/net/hawyn/screenshotfreedoma17/MainActivity.kt',
-        'app/src/main/java/net/hawyn/screenshotfreedoma17/Diagnostics.java',
-        'app/src/main/java/net/hawyn/screenshotfreedoma17/CompatController.java',
-        'native/sf17fix.cpp', 'native/README-native.txt', 'native/root-module/module.prop',
-        'app/src/main/assets/native/arm64-v8a/libsf17fix.so',
-        'app/src/main/assets/root-component/module.prop',
-    }
+        raise RuntimeError('Compatibility baseline source differs from its sealed release')
+    ui = 'app/src/main/java/net/hawyn/screenshotfreedoma17/'
+    allowed = {ui + 'MainActivity.kt', ui + 'LicenseContent.kt'}
     def functional(name):
         return (name.startswith('app/src/') or
                 (name.startswith('native/') and 'build' not in Path(name).parts) or
@@ -114,21 +107,18 @@ def verify_compatibility_update_scope():
         digest = hashlib.sha256(data).hexdigest()
         if name in allowed:
             changed[name] = {'baseline_sha256': hashlib.sha256(previous[name]).hexdigest(), 'sha256': digest}
-        elif name == 'native/root-module/customize.sh':
-            if data.replace(b'3.5.9', b'3.4.2', 1) != previous[name]:
-                raise RuntimeError('Root installer banner changed beyond the version label')
-            changed[name] = {'scope': 'Version label only', 'sha256': digest}
         elif data != previous[name]:
             raise RuntimeError('Compatibility update changed a protected file: ' + name)
         else:
             protected[name] = digest
     report = {'result': 'PASS', 'versionName': VERSION, 'versionCode': VERSION_CODE,
-              'baseline_version': '3.5.8_debug', 'allowed_functional_files': changed,
+              'baseline_version': baseline_version, 'allowed_functional_files': changed,
               'byte_identical_functional_files': protected,
               'device_validation': False,
-              'scope': 'Native mapped-file access/cache, verified installer migration, opt-in logs and log controls. '
-                       'Capture hooks, arbitration protocol/broker, root service, renderer and appearance preferences are preserved.'}
-    target = ROOT / 'verification/v359-compatibility-scope-verification.json'
+              'scope': 'Share the home footer across all full pages. '
+                       'License content and system capture code are preserved.'}
+    tag = 'v' + VERSION.replace('.', '')
+    target = ROOT / 'verification' / f'{tag}-compatibility-scope-verification.json'
     target.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     print('COMPATIBILITY_UPDATE_SCOPE_OK', len(protected), 'byte-identical functional files')
 
@@ -310,6 +300,7 @@ def package_sources():
         selected.extend(p for p in (ROOT / directory).rglob('*') if p.is_file()
                         and '__pycache__' not in p.parts and p.suffix != '.pyc'
                         and p.name != 'preserve_release.py')
+    selected.extend(path for path in (ROOT / 'LICENSES').glob('*.txt') if path.is_file())
     selected.extend(p for p in (ROOT / 'native').rglob('*') if p.is_file()
                     and 'build' not in p.relative_to(ROOT / 'native').parts)
     selected.append(ROOT / 'app/build.gradle.kts')
@@ -324,6 +315,10 @@ def package_sources():
             selected.append(report)
     selected.extend(p for p in (ROOT / 'verification').glob('v300-*.json')
                     if p.is_file() and p.name != 'v300-package-verification.json')
+    for name in ['V360-ReleaseNotes.txt', 'V361-ReleaseNotes.txt', 'V362-ReleaseNotes.txt', 'V363-ReleaseNotes.txt', 'V' + VERSION.replace('.', '') + '-ReleaseNotes.txt']:
+        release_note = ROOT / 'verification' / name
+        if release_note.is_file():
+            selected.append(release_note)
     current_tag = 'v' + VERSION.replace('.', '')
     if current_tag != 'v300':
         selected.extend(p for p in (ROOT / 'verification').glob(current_tag + '-*.json')
@@ -370,8 +365,7 @@ def main():
             verify_unchanged_system_component()
         else:
             prepare_native()
-            if VERSION == '3.5.9':
-                verify_compatibility_update_scope()
+            verify_compatibility_update_scope()
         gradle(':app:assembleRelease', '--write-locks')
     unsigned = ROOT / 'app/build/outputs/apk/release/app-release-unsigned.apk'
     if not unsigned.is_file():

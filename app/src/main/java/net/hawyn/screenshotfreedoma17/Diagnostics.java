@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 package net.hawyn.screenshotfreedoma17;
 
 import android.content.ContentResolver;

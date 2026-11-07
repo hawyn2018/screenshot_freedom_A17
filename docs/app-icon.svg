@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="18 18 72 72" role="img" aria-labelledby="title">
+  <title id="title">Screenshot Freedom A17</title>
+  <!-- The launcher artwork uses this fixed palette when system Monet colors are unavailable. -->
+  <rect x="18" y="18" width="72" height="72" rx="17" fill="#155E75"/>
+  <path transform="translate(13.2 13.2) scale(1.7)"
+        d="M12,19v-7h7M29,12h7v7M36,29v7h-7M19,36h-7v-7M19,24l4,4l8,-9"
+        fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round"/>
+</svg>

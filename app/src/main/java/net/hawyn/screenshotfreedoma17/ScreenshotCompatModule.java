@@ -73,6 +73,7 @@ public final class ScreenshotCompatModule extends XposedModule {
     private final ThreadLocal<CaptureCaller> screenshotCallerUid = new ThreadLocal<>();
     private final ThreadLocal<CapturePolicyBroker.LegacyDisplay> vendorDisplayRequest = new ThreadLocal<>();
     private final ThreadLocal<Boolean> vendorSecureDisplayCreation = new ThreadLocal<>();
+    private final ThreadLocal<MirrorInvocation> adbMirrorInvocation = new ThreadLocal<>();
     private final ThreadLocal<Boolean> originalWindowPolicyCheck = new ThreadLocal<>();
     private final DeferredCaptureIdentity<CaptureCaller> deferredScreenshotCallers = new DeferredCaptureIdentity<>(64);
     private final ThreadLocal<DeferredCaptureIdentity.Ticket<CaptureCaller>> screenshotRequest = new ThreadLocal<>();
@@ -99,6 +100,7 @@ public final class ScreenshotCompatModule extends XposedModule {
         hostClassLoader = param.getClassLoader();
         installCommon(hostClassLoader);
         installSystemServer(hostClassLoader);
+        policyBroker.setReadinessPreferences(settings);
         policyBroker.startReadiness(hostClassLoader);
         info("ready process=" + processLabel + " totalHooks=" + installed.size());
     }
@@ -169,6 +171,7 @@ public final class ScreenshotCompatModule extends XposedModule {
                 installRecorderSecureNotice(loader);
                 if (hostSystemServer) {
                     installSystemServer(loader);
+                    policyBroker.setReadinessPreferences(settings);
                     policyBroker.startReadiness(loader);
                 }
                 completed = true;
@@ -1036,13 +1039,23 @@ public final class ScreenshotCompatModule extends XposedModule {
             matched++;
             AtomicInteger samples = new AtomicInteger();
             if (installRecording(method, chain -> {
+                MirrorInvocation previousMirror = adbMirrorInvocation.get();
+                if (previousMirror != null && arguments.verifiedMirrorAdapter
+                        && previousMirror.adapter == chain.getThisObject()
+                        && previousMirror.callback == chain.getArg(0)) return chain.proceed();
                 Boolean previousMarker = vendorSecureDisplayCreation.get();
                 boolean callerScope = false;
                 vendorSecureDisplayCreation.set(false);
                 try {
-                if (chain.getArg(arguments.projection) == null) return chain.proceed();
+                boolean projection = chain.getArg(arguments.projection) != null;
+                boolean adbMirror = AdbMirrorProfile.eligible(arguments.verifiedMirrorAdapter, projection,
+                        (Integer) chain.getArg(arguments.ownerUid), (Integer) chain.getArg(arguments.flags),
+                        arguments.virtualDevice >= 0 && chain.getArg(arguments.virtualDevice) != null);
+                if (!projection && !adbMirror) return chain.proceed();
+                if (adbMirror && !displayDestructionTracked) return chain.proceed();
                 if (!beginCallerScope()) throw new CapturePolicyFailure("Capture module is being reloaded", null);
                 callerScope = true;
+                if (adbMirror) adbMirrorInvocation.set(new MirrorInvocation(chain.getThisObject(), chain.getArg(0)));
                 CapturePolicyBroker.Lease lease;
                 Object[] replacement;
                 int before;
@@ -1061,6 +1074,16 @@ public final class ScreenshotCompatModule extends XposedModule {
                     String capturedOwnerPackage = ownerPackage;
                     lease = policyBroker.beginQualified("PROJECTION", () -> {
                         flagAllowed[0] = false;
+                        if (adbMirror) {
+                            java.util.function.Predicate<String> qualify = tool -> {
+                                flagAllowed[0] = captureToolAllowed(tool, KEY_FLAG_SECURE_TOOLS);
+                                return captureToolAllowed(tool, KEY_SKIP_SCREENSHOT_TOOLS);
+                            };
+                            if (capturedOwnerUid == AdbMirrorProfile.ROOT_UID)
+                                return qualify.test(AdbMirrorProfile.ROOT_TOOL_KEY);
+                            return withVerifiedRecordingOwner(chain.getThisObject(), contextGetter, contextField,
+                                    capturedOwnerUid, capturedOwnerPackage, true, qualify);
+                        }
                         flagAllowed[0] = recordingToolAllowed(chain.getThisObject(), contextGetter, contextField,
                                 capturedOwnerUid, capturedOwnerPackage, KEY_FLAG_SECURE_TOOLS);
                         return recordingToolAllowed(chain.getThisObject(), contextGetter, contextField,
@@ -1075,6 +1098,7 @@ public final class ScreenshotCompatModule extends XposedModule {
                     replacement[arguments.flags] = after;
                 } catch (Throwable error) {
                     runtimeError(method, "projection arbitration unavailable; original creation retained", error);
+                    if (adbMirror) return chain.proceed();
                     ownerUid = (Integer) chain.getArg(arguments.ownerUid);
                     ownerPackage = (String) chain.getArg(arguments.ownerPackage);
                     replacement = chain.getArgs().toArray();
@@ -1096,12 +1120,14 @@ public final class ScreenshotCompatModule extends XposedModule {
                 if (result == null) policyBroker.finishAfterDisplayCommit(lease, loader);
                 else if (lease.arbitrating) policyBroker.retainDisplay(result, lease);
                 if (samples.incrementAndGet() <= SAMPLE_LIMIT) {
-                    info("projection tool=" + ownerPackage + " uid=" + ownerUid
+                    info((adbMirror ? "ADB mirror tool=" : "projection tool=") + ownerPackage + " uid=" + ownerUid
                             + " flags=0x" + Integer.toHexString(before) + "->0x" + Integer.toHexString(after)
                             + " resultNull=" + (result == null));
                 }
                 return result;
                 } finally {
+                    if (previousMirror == null) adbMirrorInvocation.remove();
+                    else adbMirrorInvocation.set(previousMirror);
                     if (previousMarker == null) vendorSecureDisplayCreation.remove();
                     else vendorSecureDisplayCreation.set(previousMarker);
                     if (callerScope) endCallerScope();
@@ -1110,7 +1136,7 @@ public final class ScreenshotCompatModule extends XposedModule {
         }
         if (matched == 0) info("zero compatible recording virtual display signatures in " + adapter.getName());
         info("recording virtual display hooks matched=" + matched + " installed=" + hooked
-                + "; changes apply to newly created MediaProjection displays");
+                + "; changes apply to newly created MediaProjection and qualified ADB mirror displays");
     }
 
     private void installDisplayDestructionTracking(ClassLoader loader) {
@@ -1119,7 +1145,8 @@ public final class ScreenshotCompatModule extends XposedModule {
         int matched = 0;
         for (Method method : methods(device)) {
             if (!method.getName().equals("destroyLocked") || method.getReturnType() != void.class
-                    || method.getParameterCount() != 1 || method.getParameterTypes()[0] != boolean.class) continue;
+                    || Modifier.isStatic(method.getModifiers()) || method.getParameterCount() > 1
+                    || (method.getParameterCount() == 1 && method.getParameterTypes()[0] != boolean.class)) continue;
             matched++;
             if (!installed.add(method)) continue;
             try {
@@ -1151,6 +1178,8 @@ public final class ScreenshotCompatModule extends XposedModule {
         Class<?>[] types = method.getParameterTypes();
         int projection = -1;
         int surface = -1;
+        int virtualDevice = -1;
+        boolean ambiguousVirtualDevice = false;
         for (int i = 0; i < types.length; i++) {
             if (types[i].getName().equals("android.media.projection.IMediaProjection")) {
                 if (projection != -1) return null;
@@ -1160,11 +1189,22 @@ public final class ScreenshotCompatModule extends XposedModule {
                 if (surface != -1) return null;
                 surface = i;
             }
+            if (types[i].getName().equals("android.companion.virtual.IVirtualDevice")) {
+                if (virtualDevice != -1) ambiguousVirtualDevice = true;
+                virtualDevice = i;
+            }
         }
         if (projection == -1 || surface == -1 || surface + 1 >= types.length
                 || types[surface + 1] != int.class || projection + 2 >= types.length
                 || types[projection + 1] != int.class || types[projection + 2] != String.class) return null;
-        return new RecordingArguments(projection, surface, surface + 1, projection + 1, projection + 2);
+        // Match the actual DisplayManager adapter protocol, including older
+        // positional display parameters. A name or Surface by itself is not proof.
+        boolean verifiedMirrorAdapter = !Modifier.isStatic(method.getModifiers()) && !ambiguousVirtualDevice
+                && projection == 1 && types[0].isInterface()
+                && types[0].getName().equals("android.hardware.display.IVirtualDisplayCallback")
+                && surface > projection + 2;
+        return new RecordingArguments(projection, surface, surface + 1, projection + 1, projection + 2,
+                virtualDevice, verifiedMirrorAdapter);
     }
 
     private Method recordingContextGetter(Class<?> adapter) {
@@ -1571,9 +1611,16 @@ public final class ScreenshotCompatModule extends XposedModule {
     /** The adapter's owner is the collecting tool, never the app visible in its output. */
     private boolean recordingToolAllowed(Object adapter, Method getter, Field field,
                                          int ownerUid, String ownerPackage, String mechanismKey) throws Exception {
-        if (adapter == null || ownerUid < 0 || ownerPackage == null || ownerPackage.isEmpty()
-                || (getter == null && field == null)) return false;
-        Context context = (Context) (getter != null ? getter.invoke(adapter) : field.get(adapter));
+        return withVerifiedRecordingOwner(adapter, getter, field, ownerUid, ownerPackage, false,
+                tool -> captureToolAllowed(tool, mechanismKey));
+    }
+
+    private boolean withVerifiedRecordingOwner(Object adapter, Method getter, Field field,
+                                               int ownerUid, String ownerPackage, boolean systemFallback,
+                                               java.util.function.Predicate<String> policy) throws Exception {
+        if (adapter == null || ownerUid < 0 || ownerPackage == null || ownerPackage.isEmpty()) return false;
+        Context context = (Context) (getter != null ? getter.invoke(adapter) : field == null ? null : field.get(adapter));
+        if (context == null && systemFallback) context = screenshotSystemContext();
         if (context == null) return false;
         systemContext = context;
         // Only package lookup uses the host identity. Restore the caller before
@@ -1588,8 +1635,7 @@ public final class ScreenshotCompatModule extends XposedModule {
                     if (ownerPackage.equals(name)) { belongs = true; break; }
                 }
             }
-            if (!belongs) return false;
-            return captureToolAllowed(ownerPackage, mechanismKey);
+            return belongs && policy.test(ownerPackage);
         } finally {
             Binder.restoreCallingIdentity(identity);
         }
@@ -2103,19 +2149,26 @@ public final class ScreenshotCompatModule extends XposedModule {
         }
     }
 
+    private record MirrorInvocation(Object adapter, Object callback) {}
+
     private static final class RecordingArguments {
         final int projection;
         final int surface;
         final int flags;
         final int ownerUid;
         final int ownerPackage;
+        final int virtualDevice;
+        final boolean verifiedMirrorAdapter;
 
-        RecordingArguments(int projection, int surface, int flags, int ownerUid, int ownerPackage) {
+        RecordingArguments(int projection, int surface, int flags, int ownerUid, int ownerPackage,
+                           int virtualDevice, boolean verifiedMirrorAdapter) {
             this.projection = projection;
             this.surface = surface;
             this.flags = flags;
             this.ownerUid = ownerUid;
             this.ownerPackage = ownerPackage;
+            this.virtualDevice = virtualDevice;
+            this.verifiedMirrorAdapter = verifiedMirrorAdapter;
         }
     }
 

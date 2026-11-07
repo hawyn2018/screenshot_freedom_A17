@@ -2,14 +2,16 @@ package net.hawyn.screenshotfreedoma17
 
 import android.content.Context
 
+internal const val DEFAULT_ACCENT_COLOR = 0xFFD34A81L
+
 /** UI appearance belongs to the app; screenshot settings are owned by CompatController. */
 data class Appearance(
     val mode: String = "system",
     val monet: Boolean = true,
-    val followAccent: Boolean = true,
-    val accent: Long = 0xFF3478F6,
-    val palette: String = "TonalSpot",
-    val colorSpec: String = "Spec2025",
+    val followAccent: Boolean = false,
+    val accent: Long = DEFAULT_ACCENT_COLOR,
+    val palette: String = "Vibrant",
+    val colorSpec: String = "Spec2021",
     val floatingBar: Boolean = true,
     val liquidGlass: Boolean = true,
     // GLOBAL_BLUR_FIELDS_BEGIN
@@ -25,16 +27,17 @@ data class Appearance(
 )
 
 class UiPreferences(context: Context) {
+    private val defaults = Appearance()
     private val preferences = context.applicationContext.createDeviceProtectedStorageContext()
         .getSharedPreferences("appearance", Context.MODE_PRIVATE)
 
     fun read() = Appearance(
         mode = preferences.getString("mode", "system") ?: "system",
         monet = preferences.getBoolean("monet", true),
-        followAccent = preferences.getBoolean("follow_accent", true),
-        accent = preferences.getLong("accent", 0xFF3478F6),
-        palette = preferences.getString("palette", "TonalSpot") ?: "TonalSpot",
-        colorSpec = preferences.getString("color_spec", "Spec2025") ?: "Spec2025",
+        followAccent = preferences.getBoolean("follow_accent", defaults.followAccent),
+        accent = preferences.getLong("accent", defaults.accent),
+        palette = preferences.getString("palette", defaults.palette) ?: defaults.palette,
+        colorSpec = preferences.getString("color_spec", defaults.colorSpec) ?: defaults.colorSpec,
         floatingBar = preferences.getBoolean("floating_bar", true),
         liquidGlass = preferences.getBoolean("liquid_glass", true),
         // GLOBAL_BLUR_READ_BEGIN

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 #pragma once
 #include <cstdint>
 #include <functional>
@@ -13,6 +13,8 @@ struct EngineState {
     bool ok = false, supported = false, active = false, known = false, owned = false;
     bool statePresent = false, unmanaged = false;
     std::string reason, json;
+    int targetPid = 0;
+    uint64_t targetStart = 0;
     bool original() const { return ok && known && !active && !owned; }
     bool unmanagedOriginal() const { return unmanaged && !supported && !statePresent && !owned && !active && !known; }
     bool safeOriginal() const { return original() || unmanagedOriginal(); }

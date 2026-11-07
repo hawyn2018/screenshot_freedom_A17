@@ -1,5 +1,6 @@
 package net.hawyn.screenshotfreedoma17;
 
+import android.content.SharedPreferences;
 import android.net.LocalSocket;
 import android.net.LocalSocketAddress;
 import android.os.Binder;
@@ -38,6 +39,9 @@ final class CapturePolicyBroker {
     private static final String SOCKET = "hawyn.screenshotcompat.policy.v1";
     private static final String LISTENER_DESCRIPTOR = "android.gui.IScreenCaptureListener";
     private static final long METADATA_PRESENCE_NANOS = 100_000_000L;
+    private static final long DISABLED_CHECK_MS = 60_000;
+    private static final long LEGACY_CONTROL_CHECK_MS = 15_000;
+    private static final long MAX_RECONNECT_MS = 30_000;
     private final Reporter reporter;
     private final Map<String, Lease> sessions = new ConcurrentHashMap<>();
     private final Map<Object, Lease> displays = new ConcurrentHashMap<>();
@@ -63,6 +67,16 @@ final class CapturePolicyBroker {
     private volatile Method legacyInventoryFactory;
     private volatile Method legacyInventoryCheck;
     private volatile BooleanSupplier arbitrationEnabled = () -> true;
+    private volatile SharedPreferences readinessPreferences;
+    private final Object readinessSignal = new Object();
+    private long readinessRevision;
+    private final SharedPreferences.OnSharedPreferenceChangeListener readinessListener = (preferences, key) -> {
+        if (!running || (key != null && !"arbitration_enabled".equals(key))) return;
+        // Close only the readiness channel. Real sessions keep their own sockets
+        // and their existing lifecycle, including END/abandon handling.
+        if (!arbitrationEnabled()) interruptControl(control);
+        signalReadiness();
+    };
 
     CapturePolicyBroker(Reporter reporter) { this.reporter = reporter; }
 
@@ -75,6 +89,7 @@ final class CapturePolicyBroker {
     }
 
     void setArbitrationEnabled(BooleanSupplier enabled) { arbitrationEnabled = enabled; }
+    void setReadinessPreferences(SharedPreferences preferences) { readinessPreferences = preferences; }
 
     private boolean arbitrationEnabled() {
         try { return arbitrationEnabled.getAsBoolean(); }
@@ -186,6 +201,7 @@ final class CapturePolicyBroker {
                 close(socket);
                 return noOp(pipeline);
             }
+            if (control == null) signalReadiness(); // A real request found a live peer during reconnect backoff.
             // No package/context lookup runs until this same authenticated socket
             // confirms a live broker. A subsequent lost ACK still becomes no-op.
             boolean allowed;
@@ -315,6 +331,7 @@ final class CapturePolicyBroker {
     void displayDestroyed(Object display, ClassLoader loader) {
         Lease lease = displays.remove(display);
         if (lease != null) finishAfterDisplayCommit(lease, loader);
+        if (control == null && running && arbitrationEnabled()) signalReadiness();
     }
 
     void displayDestructionUncertain(Object display) {
@@ -510,24 +527,37 @@ final class CapturePolicyBroker {
             return;
         }
         running = true;
+        SharedPreferences preferences = readinessPreferences;
+        if (preferences != null) try {
+            preferences.registerOnSharedPreferenceChangeListener(readinessListener);
+        } catch (Throwable ignored) {
+            // Some framework builds do not deliver remote preference callbacks.
+            // The bounded disabled check still observes their updated values.
+        }
         String generation = UUID.randomUUID().toString().replace("-", "");
         readyThread = new Thread(() -> {
             String lastState = "";
+            long retry = 1000;
             while (running) {
+                long revision;
+                synchronized (readinessSignal) { revision = readinessRevision; }
+                long waitMillis = retry;
                 try {
                     if (!arbitrationEnabled()) {
                         LocalSocket old = control;
                         control = null;
                         close(old);
-                        rememberPresence(false);
+                        if (!lastState.equals("disabled")) rememberPresence(false);
                         lastState = "disabled";
-                        Thread.sleep(1000);
+                        retry = 1000;
+                        awaitReadinessChange(revision, DISABLED_CHECK_MS);
                         continue;
                     }
                     if (control == null) {
                         LocalSocket socket = connect();
                         control = socket;
                         if (!running) { close(socket); control = null; break; }
+                        if (!arbitrationEnabled()) continue;
                         JSONObject state = request(socket, "STATUS");
                         boolean active = requiredBoolean(state, "running");
                         rememberPresence(active);
@@ -539,16 +569,29 @@ final class CapturePolicyBroker {
                             control = null;
                         } else {
                             if (!running) { close(socket); control = null; break; }
+                            if (!arbitrationEnabled()) continue;
                             JSONObject reply = request(socket, "READY " + generation);
                             rememberPresence(requiredBoolean(reply, "running"));
                             if (!bool(reply, "ready", "policy_ready")) throw new IOException("Broker readiness was not acknowledged");
                             reporter.report("capture policy READY acknowledged", null);
                             lastState = "ready";
+                            retry = 1000;
+                            waitMillis = LEGACY_CONTROL_CHECK_MS;
+                            if (Boolean.TRUE.equals(reply.opt("control_events"))) {
+                                // A compatible broker closes this control channel on
+                                // readiness loss. No STATUS traffic while healthy.
+                                socket.setSoTimeout(0);
+                                int unexpected = socket.getInputStream().read();
+                                waitMillis = 1000;
+                                throw new IOException(unexpected < 0 ? "Capture policy control disconnected"
+                                        : "Unexpected capture policy control event");
+                            }
                         }
                     } else {
                         JSONObject reply = request(control, "STATUS");
                         rememberPresence(requiredBoolean(reply, "running"));
                         if (!bool(reply, "ready", "policy_ready")) throw new IOException("Broker control is no longer ready");
+                        waitMillis = LEGACY_CONTROL_CHECK_MS;
                     }
                 } catch (Throwable error) {
                     LocalSocket old = control;
@@ -556,10 +599,14 @@ final class CapturePolicyBroker {
                     close(old);
                     rememberPresence(false);
                     String state = error.getClass().getName() + ":" + error.getMessage();
-                    if (!state.equals(lastState)) reporter.report("capture policy readiness pending", error);
+                    if (running && arbitrationEnabled() && !state.equals(lastState)) {
+                        reporter.report("capture policy readiness pending", error);
+                    }
                     lastState = state;
+                    waitMillis = Math.min(waitMillis, retry);
                 }
-                try { Thread.sleep(1000); }
+                if (control == null) retry = Math.min(retry * 2, MAX_RECONNECT_MS);
+                try { awaitReadinessChange(revision, waitMillis); }
                 catch (InterruptedException stopped) { if (!running) break; }
             }
         }, "ScreenshotCompat-policy-ready");
@@ -567,11 +614,35 @@ final class CapturePolicyBroker {
         readyThread.start();
     }
 
+    private void signalReadiness() {
+        synchronized (readinessSignal) {
+            readinessRevision++;
+            readinessSignal.notifyAll();
+        }
+    }
+
+    private void awaitReadinessChange(long revision, long timeout) throws InterruptedException {
+        synchronized (readinessSignal) {
+            if (running && readinessRevision == revision) readinessSignal.wait(timeout);
+        }
+    }
+
+    private static void interruptControl(LocalSocket socket) {
+        // Android uses a native blocking read; shutdown wakes it before close.
+        if (socket != null) try { socket.shutdownInput(); } catch (IOException ignored) { }
+        close(socket);
+    }
+
     synchronized boolean stopReadiness() {
         running = false;
         LocalSocket old = control;
         control = null;
-        close(old);
+        interruptControl(old);
+        signalReadiness();
+        SharedPreferences preferences = readinessPreferences;
+        readinessPreferences = null;
+        if (preferences != null) try { preferences.unregisterOnSharedPreferenceChangeListener(readinessListener); }
+        catch (Throwable ignored) { }
         close(metadataSocket);
         metadataWorker.shutdownNow();
         Thread thread = readyThread;

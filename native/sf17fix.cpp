@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 // Root-side PIE executable. No code is loaded into the target process.
 // Each pipeline accepts only its independently verified semantic instruction set.
 // See README-native.txt for the proof, ownership formats and limits.
@@ -2168,9 +2168,11 @@ bool sameModule(const MappedRange& a, const MappedRange& b) {
 }
 std::string mappingEpoch(const std::vector<MappedRange>& maps) {
     std::ostringstream out;
-    std::vector<MappedRange> executable;
-    for (const auto& m : maps) if (m.permissions[2] == 'x' && m.path != "[vdso]") executable.push_back(m);
-    for (const auto& m : maps) if (std::any_of(executable.begin(), executable.end(), [&](const auto& e) { return sameModule(m, e); }))
+    using Key = std::tuple<std::string_view, uint64_t, unsigned, unsigned>;
+    auto key = [](const MappedRange& m) -> Key { return {m.path, m.inode, m.major, m.minor}; };
+    std::set<Key> executable;
+    for (const auto& m : maps) if (m.permissions[2] == 'x' && m.path != "[vdso]") executable.insert(key(m));
+    for (const auto& m : maps) if (executable.contains(key(m)))
         out << m.lo << ':' << m.hi << ':' << m.offset << ':' << m.major << ':' << m.minor << ':' << m.inode << ':'
             << m.permissions << ':' << m.path.size() << ':' << m.path << '\n';
     return out.str();
@@ -3162,6 +3164,7 @@ struct Result {
     std::vector<Site> sites;
     NativeMetrics metrics;
     pid_t pid = 0; int error = 0;
+    uint64_t start = 0; // Internal identity for an optional process-exit watch.
     std::string json() const {
         std::ostringstream output;
         output << "{\"schema\":1,\"ok\":" << (ok ? "true" : "false")
@@ -3203,7 +3206,7 @@ Result operate(Pipeline pipeline, const std::string& command) {
     auto operationBegin = std::chrono::steady_clock::now();
     Result result; result.pipeline = pipeline;
     try {
-        Process p(findSf(), result.pipeline); result.pid = p.pid; result.buildId = p.image.buildId;
+        Process p(findSf(), result.pipeline); result.pid = p.pid; result.start = p.start; result.buildId = p.image.buildId;
         result.modulePath = p.image.modulePath; result.moduleBias = p.bias;
         result.moduleDevice = p.image.moduleDevice; result.moduleInode = p.image.moduleInode;
         result.sites = p.image.sites;
@@ -3267,7 +3270,7 @@ sfpolicy::EngineState brokerOperation(bool recording, bool enabled) {
     bool capability = !result.supported && (result.reason == "signature_not_found" || result.reason == "signature_ambiguous" ||
         result.reason.starts_with("unsupported_"));
     return {result.ok, result.supported, result.active, result.activeKnown, result.owned,
-            present, capability && !present, result.reason, result.json()};
+            present, capability && !present, result.reason, result.json(), result.pid, result.start};
 }
 #endif
 } // namespace
@@ -3276,6 +3279,10 @@ int main(int argc, char** argv) {
     try {
         std::string command = argc > 1 ? argv[1] : "status";
 #ifndef SF17FIX_INSPECT_ONLY
+        if (command == "supervisor-protocol" && argc == 2) {
+            std::cout << "watch-v1\n";
+            return 0;
+        }
         if (command == "policy-serve") {
             if (argc != 4) throw Error("usage", "policy-serve requires APPFILES MODULEDIR");
             return sfpolicy::serve(argv[2], argv[3], brokerOperation);

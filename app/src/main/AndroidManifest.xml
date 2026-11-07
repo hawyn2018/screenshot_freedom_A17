@@ -12,7 +12,8 @@
         android:theme="@style/AppTheme"
         android:allowBackup="false" android:supportsRtl="true">
         <meta-data android:name="module_author" android:value="Hawyn; Codex" />
-        <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTop">
+        <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTop"
+            android:enableOnBackInvokedCallback="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

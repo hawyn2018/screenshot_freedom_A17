@@ -9,7 +9,14 @@ SYSTEM_UIDS="$MODDIR/policy-system-uids.conf"
 OWNDIR=/data/adb/enable_screenshot17fix
 child_pid=
 child_start=
+nap_pid=
+nap_start=
 umask 077
+
+module_stopped() {
+    [ -e "$MODDIR/disable" ] || [ -L "$MODDIR/disable" ] ||
+        [ -e "$MODDIR/remove" ] || [ -L "$MODDIR/remove" ]
+}
 
 service_alive() {
     case "$1" in ''|*[!0-9]*) return 1 ;; esac
@@ -165,6 +172,17 @@ owned_child_alive() {
         [ "$(process_start "$child_pid")" = "$child_start" ]
 }
 
+# Waiting for our own child is interruptible by the supervisor's TERM trap;
+# a foreground external sleep would delay --stop by the entire backoff.
+wait_idle() {
+    sleep "$1" &
+    nap_pid=$!
+    nap_start=$(process_start "$nap_pid")
+    wait "$nap_pid" 2>/dev/null
+    nap_pid=
+    nap_start=
+}
+
 broker_alive() {
     case "$1:$2" in *[!0-9:]*|:|*:|:*) return 1 ;; esac
     [ "$(process_start "$1")" = "$2" ] &&
@@ -277,10 +295,25 @@ publish_not_running() {
 
 publish_waiting() {
     waiting_reason=$1
+    [ "$waiting_reason" != "$last_waiting_reason" ] || return 0
+    last_waiting_reason=$waiting_reason
     for waiting_pipeline in screenshot recording; do
         publish "$waiting_pipeline" '{"schema":1,"pipeline":"'"$waiting_pipeline"'","ok":false,"active":false,"active_known":false,"owned":false,"supported":false,"matching":false,"phase":"config_wait","reason":"'"$waiting_reason"'"}'
     done
     publish_not_running "$waiting_reason"
+}
+
+trim_daemon_log() {
+    [ -f "$MODDIR/daemon.log" ] || return 0
+    daemon_bytes=$(stat -c '%s' "$MODDIR/daemon.log") || return 0
+    case "$daemon_bytes" in ''|*[!0-9]*) return 0 ;; esac
+    if [ "$daemon_bytes" -gt 131072 ]; then
+        if tail -c 65536 "$MODDIR/daemon.log" > "$MODDIR/daemon.log.new.$$"; then
+            mv -f "$MODDIR/daemon.log.new.$$" "$MODDIR/daemon.log"
+        else
+            rm -f "$MODDIR/daemon.log.new.$$"
+        fi
+    fi
 }
 
 generate_system_uids() {
@@ -331,6 +364,10 @@ generate_system_uids() {
 cleanup() {
     trap - EXIT
     trap '' TERM INT
+    if [ -n "$nap_pid" ] && [ -n "$nap_start" ] && [ "$(process_start "$nap_pid")" = "$nap_start" ]; then
+        kill -TERM "$nap_pid" 2>/dev/null
+        wait "$nap_pid" 2>/dev/null
+    fi
     cleanup_code=1
     if stop_broker; then
         detect_recording
@@ -341,7 +378,7 @@ cleanup() {
     fi
     if [ "$cleanup_code" = 0 ]; then
         if [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ]; then rm -f "$PIDFILE"; fi
-        if [ -f "$MODDIR/disable" ] || [ -f "$MODDIR/remove" ]; then
+        if module_stopped; then
             publish_not_running module_disabled
         else
             publish_not_running service_stopped
@@ -391,7 +428,12 @@ trap cleanup EXIT TERM INT
 # belongs to the child while it holds native.lock; do not cold-scan both pipes
 # repeatedly in the shell before launching the child.
 recording_cli=1
-while [ ! -f "$MODDIR/disable" ] && [ ! -f "$MODDIR/remove" ]; do
+supervisor_protocol=$("$BIN" supervisor-protocol 2>/dev/null)
+config_retry=2
+inventory_retry=3
+restart_retry=5
+last_waiting_reason=
+while ! module_stopped; do
     if ! stop_broker; then
         detect_recording
         publish_guardian broker_identity_unknown
@@ -406,44 +448,77 @@ while [ ! -f "$MODDIR/disable" ] && [ ! -f "$MODDIR/remove" ]; do
             if ! restore_both; then publish_guardian configuration_restore_failed; exit 1; fi
         fi
         publish_waiting awaiting_configuration
-        sleep 2
+        wait_idle "$config_retry"
+        config_retry=$((config_retry * 2))
+        [ "$config_retry" -le 15 ] || config_retry=15
         continue
     fi
+    config_retry=2
+    trim_daemon_log
     child_mode=direct-serve
     if arbitration_enabled; then
         child_mode=policy-serve
-        publish_waiting awaiting_system_host_inventory
+        [ "$last_waiting_reason" = system_host_inventory_failed ] || publish_waiting awaiting_system_host_inventory
         if ! generate_system_uids; then
             publish_waiting system_host_inventory_failed
-            sleep 3
+            wait_idle "$inventory_retry"
+            inventory_retry=$((inventory_retry * 2))
+            [ "$inventory_retry" -le 30 ] || inventory_retry=30
             continue
         fi
     fi
+    inventory_retry=3
+    last_waiting_reason=
+    read -r launched_time rest < /proc/uptime || launched_time=
     "$BIN" "$child_mode" "$APPFILES" "$MODDIR" >> "$MODDIR/daemon.log" 2>&1 &
     child_pid=$!
     child_start=$(process_start "$child_pid")
-    mode_changed=0
-    while owned_child_alive && [ ! -f "$MODDIR/disable" ] && [ ! -f "$MODDIR/remove" ]; do
-        current_mode=direct-serve
-        arbitration_enabled && current_mode=policy-serve
-        if [ "$current_mode" != "$child_mode" ]; then mode_changed=1; break; fi
-        sleep 2
-    done
-    if [ -f "$MODDIR/disable" ] || [ -f "$MODDIR/remove" ]; then break; fi
-    if [ "$mode_changed" = 1 ]; then
-        # Normal TERM confirms original code before the next child takes over.
-        if ! stop_broker; then publish_guardian mode_switch_stop_failed; exit 1; fi
-        continue
+    # Both 3.6.0 native modes watch the application settings and module
+    # markers themselves. A steady supervisor can remain blocked in wait.
+    if [ "$supervisor_protocol" != watch-v1 ]; then
+        # Mixed-version upgrade or manual rollback: the old worker still
+        # needs the supervisor to observe mode and module markers for it.
+        mode_changed=0
+        while owned_child_alive && ! module_stopped; do
+            current_mode=direct-serve
+            arbitration_enabled && current_mode=policy-serve
+            if [ "$current_mode" != "$child_mode" ]; then mode_changed=1; break; fi
+            wait_idle 2
+        done
+        if module_stopped; then break; fi
+        if [ "$mode_changed" = 1 ]; then
+            if ! stop_broker; then publish_guardian mode_switch_stop_failed; exit 1; fi
+            continue
+        fi
     fi
     wait "$child_pid" 2>/dev/null
     broker_exit=$?
     child_pid=
     child_start=
+    if module_stopped; then break; fi
+    current_mode=direct-serve
+    arbitration_enabled && current_mode=policy-serve
+    if [ "$broker_exit" = 0 ] && [ "$current_mode" != "$child_mode" ] &&
+            ! ownership_exists screenshot && ! ownership_exists recording; then
+        # The old mode already verified its restoration before exiting. The
+        # new mode independently validates originals again on startup.
+        restart_retry=5
+        continue
+    fi
+    read -r ended_time rest < /proc/uptime || ended_time=
+    launched_seconds=${launched_time%%.*}
+    ended_seconds=${ended_time%%.*}
+    case "$launched_seconds:$ended_seconds" in
+        *[!0-9:]*|:|:*|*:) ;;
+        *) [ "$((ended_seconds - launched_seconds))" -lt 120 ] || restart_retry=5 ;;
+    esac
     printf '%s\n' "Broker exited with code $broker_exit; restoring before a fresh unready restart" >> "$MODDIR/daemon.log"
     if ! stop_broker || ! restore_both; then
         publish_guardian broker_restore_failed
         exit 1
     fi
     publish_guardian broker_exited
-    sleep 5
+    wait_idle "$restart_retry"
+    restart_retry=$((restart_retry * 2))
+    [ "$restart_retry" -le 60 ] || restart_retry=60
 done
